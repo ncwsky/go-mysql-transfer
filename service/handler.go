@@ -18,6 +18,8 @@
 package service
 
 import (
+	"go-mysql-transfer/metrics"
+	"log"
 	"time"
 
 	"github.com/juju/errors"
@@ -26,117 +28,128 @@ import (
 	"github.com/siddontang/go-mysql/replication"
 
 	"go-mysql-transfer/global"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/model"
+	"go-mysql-transfer/util/logs"
 )
 
 type handler struct {
-	transfer *TransferService
-
-	requestQueue chan interface{}
+	queue chan interface{}
+	stop  chan struct{}
 }
 
-func (h *handler) OnRotate(e *replication.RotateEvent) error {
-	h.requestQueue <- global.PosRequest{
+func newHandler() *handler {
+	return &handler{
+		queue: make(chan interface{}, 4096),
+		stop:  make(chan struct{}, 1),
+	}
+}
+
+func (s *handler) OnRotate(e *replication.RotateEvent) error {
+	s.queue <- model.PosRequest{
 		Name:  string(e.NextLogName),
 		Pos:   uint32(e.Position),
 		Force: true,
 	}
-
-	return h.transfer.ctx.Err()
+	return nil
 }
 
-func (h *handler) OnTableChanged(schema, table string) error {
-	err := h.transfer.updateRule(schema, table)
+func (s *handler) OnTableChanged(schema, table string) error {
+	err := _transferService.updateRule(schema, table)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	return nil
 }
 
-func (h *handler) OnDDL(nextPos mysql.Position, _ *replication.QueryEvent) error {
-	h.requestQueue <- global.PosRequest{
+func (s *handler) OnDDL(nextPos mysql.Position, _ *replication.QueryEvent) error {
+	s.queue <- model.PosRequest{
 		Name:  nextPos.Name,
 		Pos:   nextPos.Pos,
 		Force: true,
 	}
-
-	return h.transfer.ctx.Err()
+	return nil
 }
 
-func (h *handler) OnXID(nextPos mysql.Position) error {
-	h.requestQueue <- global.PosRequest{
+func (s *handler) OnXID(nextPos mysql.Position) error {
+	s.queue <- model.PosRequest{
 		Name:  nextPos.Name,
 		Pos:   nextPos.Pos,
 		Force: false,
 	}
-
-	return h.transfer.ctx.Err()
+	return nil
 }
 
-func (h *handler) OnRow(e *canal.RowsEvent) error {
+func (s *handler) OnRow(e *canal.RowsEvent) error {
 	ruleKey := global.RuleKey(e.Table.Schema, e.Table.Name)
 	if !global.RuleInsExist(ruleKey) {
 		return nil
 	}
 
-	var requests []*global.RowRequest
+	var requests []*model.RowRequest
+	if e.Action != canal.UpdateAction {
+		// 定长分配
+		requests = make([]*model.RowRequest, 0, len(e.Rows))
+	}
+
 	if e.Action == canal.UpdateAction {
 		for i := 0; i < len(e.Rows); i++ {
 			if (i+1)%2 == 0 {
-				rr := global.RowRequestPool.Get().(*global.RowRequest)
-				rr.RuleKey = ruleKey
-				rr.Action = e.Action
-				rr.Row = e.Rows[i]
-				requests = append(requests, rr)
+				v := new(model.RowRequest)
+				v.RuleKey = ruleKey
+				v.Action = e.Action
+				v.Timestamp = e.Header.Timestamp
+				if global.Cfg().IsReserveRawData() {
+					v.Old = e.Rows[i-1]
+				}
+				v.Row = e.Rows[i]
+				requests = append(requests, v)
 			}
 		}
 	} else {
 		for _, row := range e.Rows {
-			rr := global.RowRequestPool.Get().(*global.RowRequest)
-			rr.RuleKey = ruleKey
-			rr.Action = e.Action
-			rr.Row = row
-			requests = append(requests, rr)
+			v := new(model.RowRequest)
+			v.RuleKey = ruleKey
+			v.Action = e.Action
+			v.Timestamp = e.Header.Timestamp
+			v.Row = row
+			requests = append(requests, v)
 		}
 	}
-	h.requestQueue <- requests
+	s.queue <- requests
 
-	return h.transfer.ctx.Err()
-}
-
-func (h *handler) OnGTID(gtid mysql.GTIDSet) error {
 	return nil
 }
 
-func (h *handler) OnPosSynced(pos mysql.Position, set mysql.GTIDSet, force bool) error {
+func (s *handler) OnGTID(gtid mysql.GTIDSet) error {
 	return nil
 }
 
-func (h *handler) String() string {
+func (s *handler) OnPosSynced(pos mysql.Position, set mysql.GTIDSet, force bool) error {
+	return nil
+}
+
+func (s *handler) String() string {
 	return "TransferHandler"
 }
 
-func (h *handler) startRequestQueueListener() {
+func (s *handler) startListener() {
 	go func() {
-		h.transfer.listenerStarted.Store(true)
-		interval := time.Duration(h.transfer.config.FlushBulkInterval)
-		bulkSize := h.transfer.config.BulkSize
-
+		interval := time.Duration(global.Cfg().FlushBulkInterval)
+		bulkSize := global.Cfg().BulkSize
 		ticker := time.NewTicker(time.Millisecond * interval)
 		defer ticker.Stop()
-		defer h.transfer.wg.Done()
 
 		lastSavedTime := time.Now()
-		requests := make([]*global.RowRequest, 0, bulkSize)
+		requests := make([]*model.RowRequest, 0, bulkSize)
 		var current mysql.Position
-
+		from, _ := _transferService.positionDao.Get()
 		for {
 			needFlush := false
 			needSavePos := false
 			select {
-			case v := <-h.requestQueue:
+			case v := <-s.queue:
 				switch v := v.(type) {
-				case global.PosRequest:
+				case model.PosRequest:
 					now := time.Now()
 					if v.Force || now.Sub(lastSavedTime) > 3*time.Second {
 						lastSavedTime = now
@@ -147,30 +160,40 @@ func (h *handler) startRequestQueueListener() {
 							Pos:  v.Pos,
 						}
 					}
-				case []*global.RowRequest:
+				case []*model.RowRequest:
 					requests = append(requests, v...)
-					needFlush = len(requests) >= h.transfer.config.BulkSize
+					needFlush = int64(len(requests)) >= global.Cfg().BulkSize
 				}
 			case <-ticker.C:
 				needFlush = true
-			case <-h.transfer.ctx.Done():
+			case <-s.stop:
 				return
 			}
 
-			if needFlush {
-				if len(requests) > 0 {
-					h.transfer.endpoint.Consume(requests)
-					requests = requests[0:0]
+			if needFlush && len(requests) > 0 && _transferService.endpointEnable.Load() {
+				err := _transferService.endpoint.Consume(from, requests)
+				if err != nil {
+					_transferService.endpointEnable.Store(false)
+					metrics.SetDestState(metrics.DestStateFail)
+					logs.Error(err.Error())
+					go _transferService.stopDump()
 				}
+				requests = requests[0:0]
 			}
-			if needSavePos {
-				logutil.Infof("save position %s %d", current.Name, current.Pos)
-				if err := h.transfer.positionStorage.Save(current); err != nil {
-					logutil.Errorf("save sync position %s err %v, close sync", current, err)
-					h.transfer.cancelFunc()
+			if needSavePos && _transferService.endpointEnable.Load() {
+				logs.Infof("save position %s %d", current.Name, current.Pos)
+				if err := _transferService.positionDao.Save(current); err != nil {
+					logs.Errorf("save sync position %s err %v, close sync", current, err)
+					_transferService.Close()
 					return
 				}
+				from = current
 			}
 		}
 	}()
+}
+
+func (s *handler) stopListener() {
+	log.Println("transfer stop")
+	s.stop <- struct{}{}
 }

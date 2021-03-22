@@ -23,11 +23,10 @@ import (
 	"github.com/siddontang/go-mysql/mysql"
 
 	"go-mysql-transfer/global"
-	"go-mysql-transfer/util/etcdutil"
+	"go-mysql-transfer/util/etcds"
 )
 
 type etcdPositionStorage struct {
-	Conf *global.Config
 }
 
 func (s *etcdPositionStorage) Initialize() error {
@@ -36,7 +35,7 @@ func (s *etcdPositionStorage) Initialize() error {
 		return err
 	}
 
-	err = etcdutil.CreateIfNecessary(s.Conf.ZePositionDir(), string(data), _etcdOps)
+	err = etcds.CreateIfNecessary(global.Cfg().ZkPositionDir(), string(data), _etcdOps)
 	if err != nil {
 		return err
 	}
@@ -50,13 +49,13 @@ func (s *etcdPositionStorage) Save(pos mysql.Position) error {
 		return err
 	}
 
-	return etcdutil.Save(s.Conf.ZePositionDir(), string(data), _etcdOps)
+	return etcds.Save(global.Cfg().ZkPositionDir(), string(data), _etcdOps)
 }
 
 func (s *etcdPositionStorage) Get() (mysql.Position, error) {
 	var entity mysql.Position
 
-	data, _, err := etcdutil.Get(s.Conf.ZePositionDir(), _etcdOps)
+	data, _, err := etcds.Get(global.Cfg().ZkPositionDir(), _etcdOps)
 	if err != nil {
 		return entity, err
 	}

@@ -18,9 +18,10 @@
 package luaengine
 
 import (
-	lua "github.com/yuin/gopher-lua"
+	"github.com/yuin/gopher-lua"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/model"
 )
 
 func mqModule(L *lua.LState) int {
@@ -46,7 +47,7 @@ func msgSend(L *lua.LState) int {
 	return 0
 }
 
-func DoMQOps(input map[string]interface{}, action string, rule *global.Rule) ([]*global.MQRespond, error) {
+func DoMQOps(input map[string]interface{}, action string, rule *global.Rule) ([]*model.MQRespond, error) {
 	L := _pool.Get()
 	defer _pool.Put(L)
 
@@ -64,9 +65,9 @@ func DoMQOps(input map[string]interface{}, action string, rule *global.Rule) ([]
 		return nil, err
 	}
 
-	list := make([]*global.MQRespond, 0, ret.Len())
+	list := make([]*model.MQRespond, 0, ret.Len())
 	ret.ForEach(func(k lua.LValue, v lua.LValue) {
-		resp := global.MQRespondPool.Get().(*global.MQRespond)
+		resp := new(model.MQRespond)
 		resp.ByteArray = lvToByteArray(k)
 		resp.Topic = lvToString(v)
 		list = append(list, resp)

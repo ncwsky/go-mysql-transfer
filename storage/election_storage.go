@@ -26,12 +26,9 @@ type ElectionStorage interface {
 func NewElectionStorage(conf *global.Config) PositionStorage {
 	if conf.IsCluster() {
 		if conf.IsZk() {
-			return &zkPositionStorage{
-				Conf: conf,
-			}
+			return &zkPositionStorage{}
 		}
 		if conf.IsEtcd() {
-
 		}
 	}
 

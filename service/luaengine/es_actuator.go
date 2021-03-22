@@ -19,9 +19,10 @@ package luaengine
 
 import (
 	"github.com/siddontang/go-mysql/canal"
-	lua "github.com/yuin/gopher-lua"
+	"github.com/yuin/gopher-lua"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/model"
 	"go-mysql-transfer/util/stringutil"
 )
 
@@ -87,7 +88,7 @@ func esDelete(L *lua.LState) int {
 	return 0
 }
 
-func DoESOps(input map[string]interface{}, action string, rule *global.Rule) ([]*global.ESRespond, error) {
+func DoESOps(input map[string]interface{}, action string, rule *global.Rule) ([]*model.ESRespond, error) {
 	L := _pool.Get()
 	defer _pool.Put(L)
 
@@ -105,9 +106,9 @@ func DoESOps(input map[string]interface{}, action string, rule *global.Rule) ([]
 		return nil, err
 	}
 
-	responds := make([]*global.ESRespond, 0, ret.Len())
+	responds := make([]*model.ESRespond, 0, ret.Len())
 	ret.ForEach(func(k lua.LValue, v lua.LValue) {
-		resp := new(global.ESRespond)
+		resp := new(model.ESRespond)
 		resp.Index = lvToString(L.GetTable(v, lua.LString("index")))
 		resp.Id = lvToString(L.GetTable(v, lua.LString("id")))
 		resp.Action = lvToString(L.GetTable(v, lua.LString("action")))

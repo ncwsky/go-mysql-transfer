@@ -18,81 +18,99 @@
 package endpoint
 
 import (
+	"bytes"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pquerna/ffjson/ffjson"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/siddontang/go-mysql/canal"
 	"github.com/siddontang/go-mysql/mysql"
 	"github.com/siddontang/go-mysql/schema"
-	"github.com/vmihailenco/msgpack"
 
 	"go-mysql-transfer/global"
-	"go-mysql-transfer/storage"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/model"
+	"go-mysql-transfer/service/luaengine"
+	"go-mysql-transfer/util/logs"
 	"go-mysql-transfer/util/stringutil"
 )
 
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+const defaultDateFormatter = "2006-01-02"
+
 type Endpoint interface {
-	Start() error
+	Connect() error
 	Ping() error
-	Consume([]*global.RowRequest)
-	Stock([]*global.RowRequest) int64
+	Consume(mysql.Position, []*model.RowRequest) error
+	Stock([]*model.RowRequest) int64
 	Close()
 }
 
-func NewEndpoint(c *global.Config) Endpoint {
-	if c.IsRedis() {
-		return newRedisEndpoint(c)
+func NewEndpoint(ds *canal.Canal) Endpoint {
+	cfg := global.Cfg()
+	luaengine.InitActuator(ds)
+
+	if cfg.IsRedis() {
+		return newRedisEndpoint()
 	}
 
-	if c.IsRocketmq() {
-		return newRocketEndpoint(c)
+	if cfg.IsMongodb() {
+		return newMongoEndpoint()
 	}
 
-	if c.IsMongodb() {
-		return newMongoEndpoint(c)
+	if cfg.IsRocketmq() {
+		return newRocketEndpoint()
 	}
 
-	if c.IsRabbitmq() {
-		return newRabbitEndpoint(c)
+	if cfg.IsRabbitmq() {
+		return newRabbitEndpoint()
 	}
 
-	if c.IsKafka() {
-		return newKafkaEndpoint(c)
+	if cfg.IsKafka() {
+		return newKafkaEndpoint()
 	}
 
-	if c.IsEls() {
-		if c.ElsVersion == 6 {
-			return newElastic6Endpoint(c)
+	if cfg.IsEls() {
+		if cfg.ElsVersion == 6 {
+			return newElastic6Endpoint()
 		}
-		if c.ElsVersion == 7 {
-			return newElastic7Endpoint(c)
+		if cfg.ElsVersion == 7 {
+			return newElastic7Endpoint()
 		}
+	}
+
+	if cfg.IsScript() {
+		return newScriptEndpoint()
 	}
 
 	return nil
 }
 
 func convertColumnData(value interface{}, col *schema.TableColumn, rule *global.Rule) interface{} {
+	if value == nil {
+		return nil
+	}
+
 	switch col.Type {
 	case schema.TYPE_ENUM:
 		switch value := value.(type) {
 		case int64:
-			// for binlog, ENUM may be int64, but for dump, enum is string
 			eNum := value - 1
 			if eNum < 0 || eNum >= int64(len(col.EnumValues)) {
 				// we insert invalid enum value before, so return empty
-				logutil.Warnf("invalid binlog enum index %d, for enum %v", eNum, col.EnumValues)
+				logs.Warnf("invalid binlog enum index %d, for enum %v", eNum, col.EnumValues)
 				return ""
 			}
-
 			return col.EnumValues[eNum]
+		case string:
+			return value
+		case []byte:
+			return string(value)
 		}
 	case schema.TYPE_SET:
 		switch value := value.(type) {
 		case int64:
-			// for binlog, SET may be int64, but for dump, SET is string
 			bitmask := value
 			sets := make([]string, 0, len(col.SetValues))
 			for i, s := range col.SetValues {
@@ -105,12 +123,9 @@ func convertColumnData(value interface{}, col *schema.TableColumn, rule *global.
 	case schema.TYPE_BIT:
 		switch value := value.(type) {
 		case string:
-			// for binlog, BIT is int64, but for dump, BIT is string
-			// for dump 0x01 is for 1, \0 is for 0
 			if value == "\x01" {
 				return int64(1)
 			}
-
 			return int64(0)
 		}
 	case schema.TYPE_STRING:
@@ -123,56 +138,106 @@ func convertColumnData(value interface{}, col *schema.TableColumn, rule *global.
 		var err error
 		switch v := value.(type) {
 		case string:
-			err = ffjson.Unmarshal([]byte(v), &f)
+			err = json.Unmarshal([]byte(v), &f)
 		case []byte:
-			err = ffjson.Unmarshal(v, &f)
+			err = json.Unmarshal(v, &f)
 		}
 		if err == nil && f != nil {
 			return f
 		}
 	case schema.TYPE_DATETIME, schema.TYPE_TIMESTAMP:
+		var vv string
 		switch v := value.(type) {
 		case string:
-			vt, err := time.ParseInLocation(mysql.TimeFormat, string(v), time.Local)
+			vv = v
+		case []byte:
+			vv = string(v)
+		}
+		if rule.DatetimeFormatter != "" {
+			vt, err := time.Parse(mysql.TimeFormat, vv)
 			if err != nil || vt.IsZero() { // failed to parse date or zero date
 				return nil
 			}
 			return vt.Format(rule.DatetimeFormatter)
-		case []byte:
-			return string(v)
 		}
+		return vv
 	case schema.TYPE_DATE:
+		var vv string
 		switch v := value.(type) {
 		case string:
-			vt, err := time.Parse(rule.DateFormatter, string(v))
+			vv = v
+		case []byte:
+			vv = string(v)
+		}
+		if rule.DateFormatter != "" {
+			vt, err := time.Parse(defaultDateFormatter, vv)
 			if err != nil || vt.IsZero() { // failed to parse date or zero date
 				return nil
 			}
 			return vt.Format(rule.DateFormatter)
+		}
+		return vv
+	case schema.TYPE_NUMBER:
+		switch v := value.(type) {
+		case string:
+			vv, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				logs.Error(err.Error())
+				return nil
+			}
+			return vv
 		case []byte:
-			return string(v)
+			str := string(v)
+			vv, err := strconv.ParseInt(str, 10, 64)
+			if err != nil {
+				logs.Error(err.Error())
+				return nil
+			}
+			return vv
+		}
+	case schema.TYPE_DECIMAL, schema.TYPE_FLOAT:
+		switch v := value.(type) {
+		case string:
+			vv, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				logs.Error(err.Error())
+				return nil
+			}
+			return vv
+		case []byte:
+			str := string(v)
+			vv, err := strconv.ParseFloat(str, 64)
+			if err != nil {
+				logs.Error(err.Error())
+				return nil
+			}
+			return vv
 		}
 	}
 
 	return value
 }
 
-func encodeStringValue(rule *global.Rule, kv map[string]interface{}) string {
-	var val string
-	if rule.ValueFormatter != "" {
-		val = rule.ValueFormatter
-		for k, v := range kv {
-			old := global.LeftBrace + k + global.RightBrace
-			new := stringutil.ToString(v)
-			val = strings.ReplaceAll(val, old, new)
+func encodeValue(rule *global.Rule, kv map[string]interface{}) string {
+	if rule.ValueTmpl != nil {
+		var tmplBytes bytes.Buffer
+		err := rule.ValueTmpl.Execute(&tmplBytes, kv)
+		if err != nil {
+			return ""
 		}
-		return val
+		return tmplBytes.String()
 	}
 
+	var val string
 	switch rule.ValueEncoder {
 	case global.ValEncoderJson:
-		data, _ := ffjson.Marshal(kv)
-		val = string(data)
+		data, err := json.Marshal(kv)
+		if err != nil {
+			logs.Error(err.Error())
+			val = ""
+		} else {
+			val = string(data)
+		}
 	case global.ValEncoderKVCommas:
 		var ls []string
 		for k, v := range kv {
@@ -191,29 +256,57 @@ func encodeStringValue(rule *global.Rule, kv map[string]interface{}) string {
 	return val
 }
 
-func keyValueMap(re *global.RowRequest, rule *global.Rule, primitive bool) map[string]interface{} {
+func rowMap(req *model.RowRequest, rule *global.Rule, primitive bool) map[string]interface{} {
 	kv := make(map[string]interface{}, len(rule.PaddingMap))
-	if primitive {
-		for _, padding := range rule.PaddingMap {
-			kv[padding.ColumnName] = convertColumnData(re.Row[padding.ColumnIndex], padding.ColumnMetadata, rule)
-		}
-		return kv
-	}
-
-	for _, padding := range rule.PaddingMap {
-		kv[padding.WrapName] = convertColumnData(re.Row[padding.ColumnIndex], padding.ColumnMetadata, rule)
-	}
 
 	if rule.DefaultColumnValueConfig != "" {
 		for k, v := range rule.DefaultColumnValueMap {
-			kv[rule.WrapName(k)] = v
+			if primitive {
+				kv[k] = v
+			} else {
+				kv[rule.WrapName(k)] = v
+			}
 		}
 	}
 
+	if primitive {
+		for _, padding := range rule.PaddingMap {
+			kv[padding.ColumnName] = convertColumnData(req.Row[padding.ColumnIndex], padding.ColumnMetadata, rule)
+		}
+	} else {
+		for _, padding := range rule.PaddingMap {
+			kv[padding.WrapName] = convertColumnData(req.Row[padding.ColumnIndex], padding.ColumnMetadata, rule)
+		}
+	}
 	return kv
 }
 
-func primaryKey(re *global.RowRequest, rule *global.Rule) interface{} {
+func oldRowMap(req *model.RowRequest, rule *global.Rule, primitive bool) map[string]interface{} {
+	kv := make(map[string]interface{}, len(rule.PaddingMap))
+
+	if rule.DefaultColumnValueConfig != "" {
+		for k, v := range rule.DefaultColumnValueMap {
+			if primitive {
+				kv[k] = v
+			} else {
+				kv[rule.WrapName(k)] = v
+			}
+		}
+	}
+
+	if primitive {
+		for _, padding := range rule.PaddingMap {
+			kv[padding.ColumnName] = convertColumnData(req.Old[padding.ColumnIndex], padding.ColumnMetadata, rule)
+		}
+	} else {
+		for _, padding := range rule.PaddingMap {
+			kv[padding.WrapName] = convertColumnData(req.Old[padding.ColumnIndex], padding.ColumnMetadata, rule)
+		}
+	}
+	return kv
+}
+
+func primaryKey(re *model.RowRequest, rule *global.Rule) interface{} {
 	if rule.IsCompositeKey { // 组合ID
 		var key string
 		for _, index := range rule.TableInfo.PKColumns {
@@ -225,32 +318,6 @@ func primaryKey(re *global.RowRequest, rule *global.Rule) interface{} {
 		data := re.Row[index]
 		column := rule.TableInfo.Columns[index]
 		return convertColumnData(data, &column, rule)
-	}
-}
-
-func pushFailedRows(rs []*global.RowRequest, cached *storage.BoltRowStorage) {
-	logutil.Infof("%d 条数据处理失败，插入重试队列", len(rs))
-
-	list := make([][]byte, 0, len(rs))
-	for _, r := range rs {
-		if data, err := msgpack.Marshal(r); err == nil {
-			list = append(list, data)
-		}
-	}
-
-	cached.BatchAdd(list)
-}
-
-func exportActionNum(action, ruleKey string) {
-	if global.Cfg().IsExporterEnable() {
-		switch action {
-		case canal.InsertAction:
-			global.IncInsertNum(ruleKey)
-		case canal.UpdateAction:
-			global.IncUpdateNum(ruleKey)
-		case canal.DeleteAction:
-			global.IncDeleteNum(ruleKey)
-		}
 	}
 }
 

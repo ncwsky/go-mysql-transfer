@@ -19,15 +19,19 @@ package global
 
 import (
 	"fmt"
-	"github.com/juju/errors"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
+	"log"
 	"path/filepath"
+	"runtime"
 	"strings"
 
-	"go-mysql-transfer/util/fileutil"
-	"go-mysql-transfer/util/logutil"
-	"go-mysql-transfer/util/netutil"
+	"github.com/juju/errors"
+	"gopkg.in/yaml.v2"
+
+	"go-mysql-transfer/util/files"
+	"go-mysql-transfer/util/logs"
+	"go-mysql-transfer/util/nets"
+	"go-mysql-transfer/util/sys"
 )
 
 const (
@@ -37,26 +41,23 @@ const (
 	_targetRabbitmq      = "RABBITMQ"
 	_targetKafka         = "KAFKA"
 	_targetElasticsearch = "ELASTICSEARCH"
+	_targetScript        = "SCRIPT"
 
 	RedisGroupTypeSentinel = "sentinel"
 	RedisGroupTypeCluster  = "cluster"
 
 	_dataDir = "store"
 
-	_zeRootDir = "/transfer" // ZooKeeper and Etcd root
+	_zkRootDir = "/transfer" // ZooKeeper and Etcd root
 
-	_flushBulkInterval  = 200
-	_flushBulkSize      = 128
-	_redisFlushBulkSize = 1024
+	_flushBulkInterval = 200
+	_flushBulkSize     = 100
 
-	DefaultDateFormatter     = "2006-01-02"
-	DefaultDatetimeFormatter = "2006-01-02 15:04:05"
+	// update or insert
+	UpsertAction = "upsert"
 )
 
-var (
-	_clusterFlag bool
-	_config      *Config
-)
+var _config *Config
 
 type Config struct {
 	Target string `yaml:"target"` // 目标类型，支持redis、mongodb
@@ -73,7 +74,8 @@ type Config struct {
 	DumpExec       string `yaml:"mysqldump"`
 	SkipMasterData bool   `yaml:"skip_master_data"`
 
-	BulkSize int `yaml:"bulk_size"`
+	Maxprocs int   `yaml:"maxprocs"` // 最大协程数，默认CPU核心数*2
+	BulkSize int64 `yaml:"bulk_size"`
 
 	FlushBulkInterval int `yaml:"flush_bulk_interval"`
 
@@ -81,13 +83,15 @@ type Config struct {
 
 	RuleConfigs []*Rule `yaml:"rule"`
 
-	LoggerConfig *logutil.LoggerConfig `yaml:"logger"` // 日志配置
+	LoggerConfig *logs.Config `yaml:"logger"` // 日志配置
 
 	EnableExporter bool `yaml:"enable_exporter"` // 启用prometheus exporter，默认false
 	ExporterPort   int  `yaml:"exporter_addr"`   // prometheus exporter端口
 
-	Cluster *Cluster `yaml:"cluster"` // 集群配置
+	EnableWebAdmin bool `yaml:"enable_web_admin"` // 启用Web监控，默认false
+	WebAdminPort   int  `yaml:"web_admin_port"`   // web监控端口,默认8060
 
+	Cluster *Cluster `yaml:"cluster"` // 集群配置
 	// ------------------- REDIS -----------------
 	RedisAddr       string `yaml:"redis_addrs"`       //redis地址
 	RedisGroupType  string `yaml:"redis_group_type"`  //集群类型 sentinel或者cluster
@@ -120,68 +124,75 @@ type Config struct {
 	ElsUser     string `yaml:"es_user"`     //Elasticsearch用户名
 	ElsPassword string `yaml:"es_password"` //Elasticsearch密码
 	ElsVersion  int    `yaml:"es_version"`  //Elasticsearch版本，支持6和7、默认为7
+
+	isReserveRawData bool //保留原始数据
+	isMQ             bool //是否消息队列
 }
 
 type Cluster struct {
 	Name             string `yaml:"name"`
+	BindIp           string `yaml:"bind_ip"` //绑定IP
 	ZkAddrs          string `yaml:"zk_addrs"`
 	ZkAuthentication string `yaml:"zk_authentication"`
 	EtcdAddrs        string `yaml:"etcd_addrs"`
 	EtcdUser         string `yaml:"etcd_user"`
 	EtcdPassword     string `yaml:"etcd_password"`
-	CurrentNode      string
 }
 
-func NewConfigWithFile(name string) (*Config, error) {
-	data, err := ioutil.ReadFile(name)
+func initConfig(fileName string) error {
+	data, err := ioutil.ReadFile(fileName)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return errors.Trace(err)
 	}
 
 	var c Config
 
 	if err := yaml.Unmarshal(data, &c); err != nil {
-		return nil, errors.Trace(err)
+		return errors.Trace(err)
 	}
 
 	if err := checkConfig(&c); err != nil {
-		return nil, errors.Trace(err)
+		return errors.Trace(err)
 	}
 
 	if err := checkClusterConfig(&c); err != nil {
-		return nil, errors.Trace(err)
+		return errors.Trace(err)
 	}
 
 	switch strings.ToUpper(c.Target) {
 	case _targetRedis:
 		if err := checkRedisConfig(&c); err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
 	case _targetRocketmq:
 		if err := checkRocketmqConfig(&c); err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
 	case _targetMongodb:
 		if err := checkMongodbConfig(&c); err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
 	case _targetRabbitmq:
 		if err := checkRabbitmqConfig(&c); err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
 	case _targetKafka:
 		if err := checkKafkaConfig(&c); err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
 	case _targetElasticsearch:
 		if err := checkElsConfig(&c); err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
+	case _targetScript:
+
+	default:
+		return errors.Errorf("unsupported target: %s", c.Target)
 	}
 
 	_config = &c
 
-	return &c, nil
+	return nil
 }
 
 func checkConfig(c *Config) error {
@@ -219,21 +230,18 @@ func checkConfig(c *Config) error {
 
 	if c.BulkSize == 0 {
 		c.BulkSize = _flushBulkSize
-		if c.IsRedis() {
-			c.BulkSize = _redisFlushBulkSize
-		}
 	}
 
 	if c.DataDir == "" {
-		c.DataDir = filepath.Join(fileutil.GetCurrentDirectory(), _dataDir)
+		c.DataDir = filepath.Join(sys.CurrentDirectory(), _dataDir)
 	}
 
-	if err := fileutil.MkdirIfNecessary(c.DataDir); err != nil {
+	if err := files.MkdirIfNecessary(c.DataDir); err != nil {
 		return err
 	}
 
 	if c.LoggerConfig == nil {
-		c.LoggerConfig = &logutil.LoggerConfig{
+		c.LoggerConfig = &logs.Config{
 			Store: filepath.Join(c.DataDir, "log"),
 		}
 	}
@@ -241,12 +249,20 @@ func checkConfig(c *Config) error {
 		c.LoggerConfig.Store = filepath.Join(c.DataDir, "log")
 	}
 
-	if err := fileutil.MkdirIfNecessary(c.LoggerConfig.Store); err != nil {
+	if err := files.MkdirIfNecessary(c.LoggerConfig.Store); err != nil {
 		return err
 	}
 
 	if c.ExporterPort == 0 {
 		c.ExporterPort = 9595
+	}
+
+	if c.WebAdminPort == 0 {
+		c.WebAdminPort = 8060
+	}
+
+	if c.Maxprocs <= 0 {
+		c.Maxprocs = runtime.NumCPU() * 2
 	}
 
 	if c.RuleConfigs == nil {
@@ -262,12 +278,10 @@ func Cfg() *Config {
 
 func checkClusterConfig(c *Config) error {
 	if c.Cluster == nil {
-		_clusterFlag = false
 		return nil
 	}
 
 	if c.Cluster.ZkAddrs == "" && c.Cluster.EtcdAddrs == "" {
-		_clusterFlag = false
 		return nil
 	}
 
@@ -275,17 +289,26 @@ func checkClusterConfig(c *Config) error {
 		return errors.Errorf("empty name not allowed in cluster")
 	}
 
-	ips, err := netutil.GetIpList()
-	if err != nil {
-		return err
+	if c.Cluster.BindIp != "" && !nets.CheckIp(c.Cluster.BindIp) {
+		return errors.New("配置文件错误：配置项'bind_ip' 应为一个IP地址，可以为空")
 	}
-	c.Cluster.CurrentNode = fmt.Sprintf("%v", ips)
+	if c.Cluster.BindIp == "" {
+		ips, err := nets.GetIpList()
+		if err != nil {
+			return err
+		}
+		if len(ips) > 1 {
+			return errors.New(fmt.Sprintf(
+				"检测到机器上存在多个IP地址：%v，无法确定向其他集群节点暴露那个IP。请在配置文件'bind_ip'配置项中指定", ips))
+		}
+		c.Cluster.BindIp = ips[0]
+	}
 
 	if c.IsZk() {
-		logutil.BothInfof("cluster by Zookeeper")
+		log.Println("cluster by Zookeeper")
 	}
 	if c.IsEtcd() {
-		logutil.BothInfof("cluster by Etcd")
+		log.Println("cluster by Etcd")
 	}
 
 	return nil
@@ -306,6 +329,7 @@ func checkRedisConfig(c *Config) error {
 		}
 	}
 
+	c.isReserveRawData = true
 	return nil
 }
 
@@ -314,6 +338,8 @@ func checkRocketmqConfig(c *Config) error {
 		return errors.Errorf("empty rocketmq_name_servers not allowed")
 	}
 
+	c.isReserveRawData = true
+	c.isMQ = true
 	return nil
 }
 
@@ -330,6 +356,8 @@ func checkRabbitmqConfig(c *Config) error {
 		return errors.Errorf("empty rabbitmq_addr not allowed")
 	}
 
+	c.isReserveRawData = true
+	c.isMQ = true
 	return nil
 }
 
@@ -338,12 +366,18 @@ func checkKafkaConfig(c *Config) error {
 		return errors.Errorf("empty kafka_addrs not allowed")
 	}
 
+	c.isReserveRawData = true
+	c.isMQ = true
 	return nil
 }
 
 func checkElsConfig(c *Config) error {
 	if len(c.ElsAddr) == 0 {
 		return errors.Errorf("empty es_addrs not allowed")
+	}
+
+	if !strings.HasPrefix(c.ElsAddr, "http") {
+		c.ElsAddr = "http://" + c.ElsAddr
 	}
 
 	if c.ElsVersion == 0 {
@@ -359,14 +393,6 @@ func checkElsConfig(c *Config) error {
 
 func (c *Config) IsCluster() bool {
 	if !c.IsZk() && !c.IsEtcd() {
-		return false
-	}
-
-	return true
-}
-
-func (c *Config) NotCluster() bool {
-	if c.IsZk() || c.IsEtcd() {
 		return false
 	}
 
@@ -419,8 +445,20 @@ func (c *Config) IsEls() bool {
 	return strings.ToUpper(c.Target) == _targetElasticsearch
 }
 
+func (c *Config) IsScript() bool {
+	return strings.ToUpper(c.Target) == _targetScript
+}
+
 func (c *Config) IsExporterEnable() bool {
 	return c.EnableExporter
+}
+
+func (c *Config) IsReserveRawData() bool {
+	return c.isReserveRawData
+}
+
+func (c *Config) IsMQ() bool {
+	return c.isMQ
 }
 
 func (c *Config) Destination() string {
@@ -450,26 +488,70 @@ func (c *Config) Destination() string {
 		des += "elasticsearch("
 		des += c.ElsAddr
 		des += ")"
+	case _targetScript:
+		des += "Lua Script"
 	}
 	return des
 }
 
-func (c *Config) ZeRootDir() string {
-	return _zeRootDir
+func (c *Config) DestStdName() string {
+	switch strings.ToUpper(c.Target) {
+	case _targetRedis:
+		return "Redis"
+	case _targetRocketmq:
+		return "RocketMQ"
+	case _targetMongodb:
+		return "MongoDB"
+	case _targetRabbitmq:
+		return "RabbitMQ"
+	case _targetKafka:
+		return "Kafka"
+	case _targetElasticsearch:
+		return "Elasticsearch"
+	}
+
+	return ""
 }
 
-func (c *Config) ZeClusterDir() string {
-	return _zeRootDir + "/" + c.Cluster.Name
+func (c *Config) DestAddr() string {
+	switch strings.ToUpper(c.Target) {
+	case _targetRedis:
+		return c.RedisAddr
+	case _targetRocketmq:
+		return c.RocketmqNameServers
+	case _targetMongodb:
+		return c.MongodbAddr
+	case _targetRabbitmq:
+		return c.RabbitmqAddr
+	case _targetKafka:
+		return c.KafkaAddr
+	case _targetElasticsearch:
+		return c.ElsAddr
+	}
+
+	return ""
 }
 
-func (c *Config) ZePositionDir() string {
-	return _zeRootDir + "/" + c.Cluster.Name + "/position"
+func (c *Config) ZkRootDir() string {
+	return _zkRootDir
 }
 
-func (c *Config) ZeElectionDir() string {
-	return _zeRootDir + "/" + c.Cluster.Name + "/election"
+func (c *Config) ZkClusterDir() string {
+	return _zkRootDir + "/" + c.Cluster.Name
 }
 
-func (c *Config) ZeElectedDir() string {
-	return _zeRootDir + "/" + c.Cluster.Name + "/elected"
+func (c *Config) ZkPositionDir() string {
+	return _zkRootDir + "/" + c.Cluster.Name + "/position"
+}
+
+func (c *Config) ZkElectionDir() string {
+	return _zkRootDir + "/" + c.Cluster.Name + "/election"
+}
+
+func (c *Config) ZkElectedDir() string {
+	return _zkRootDir + "/" + c.Cluster.Name + "/elected"
+}
+
+func (c *Config) ZkNodesDir() string {
+	return _zkRootDir + "/" + c.Cluster.Name + "/nodes"
 }

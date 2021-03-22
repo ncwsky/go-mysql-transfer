@@ -19,31 +19,24 @@ package stringutil
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
 
-	"github.com/pquerna/ffjson/ffjson"
 	"github.com/satori/go.uuid"
-
-	"go-mysql-transfer/util/logutil"
 )
 
 // 产生UUID
 func UUID() string {
 	return strings.ReplaceAll(uuid.NewV4().String(), "-", "")
-}
-
-// MD2编码
-func MD5(str string) string {
-	h := md5.New()
-	h.Write([]byte(str))
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 // 转换为Int
@@ -62,24 +55,6 @@ func ToInt64Safe(str string) int64 {
 		return 0
 	}
 	return v
-}
-
-// 转换为Uint64
-func ToUint32(str string) (uint32, error) {
-	v, e := strconv.ParseUint(str, 10, 32)
-	if nil != e {
-		return 0, e
-	}
-	return uint32(v), nil
-}
-
-// 转换为Uint64
-func ToUint32Safe(str string) uint32 {
-	v, e := strconv.ParseUint(str, 10, 32)
-	if nil != e {
-		return 0
-	}
-	return uint32(v)
 }
 
 // 转换为Uint64
@@ -115,10 +90,17 @@ func CommasToMap(base string, sep string) map[string]interface{} {
 	return ret
 }
 
-func ToJsonString(v interface{}) string {
-	bytes, err := ffjson.Marshal(v)
+func ToJsonBytes(v interface{}) []byte {
+	bytes, err := json.Marshal(v)
 	if nil != err {
-		logutil.GlobalSugar().Errorf("json marshal :%s", err.Error())
+		return nil
+	}
+	return bytes
+}
+
+func ToJsonString(v interface{}) string {
+	bytes, err := json.Marshal(v)
+	if nil != err {
 		return ""
 	}
 	return string(bytes)
@@ -127,7 +109,6 @@ func ToJsonString(v interface{}) string {
 func ToJsonIndent(v interface{}) string {
 	bytes, err := json.MarshalIndent(v, "", "\t")
 	if nil != err {
-		logutil.GlobalSugar().Errorf("json marshal :%s", err.Error())
 		return ""
 	}
 	return string(bytes)
@@ -226,7 +207,7 @@ func ToString(value interface{}) string {
 	case []byte:
 		key = string(value.([]byte))
 	default:
-		newValue, _ := ffjson.Marshal(value)
+		newValue, _ := json.Marshal(value)
 		key = string(newValue)
 	}
 
@@ -248,6 +229,25 @@ func IsChineseChar(str string) bool {
 		}
 	}
 	return false
+}
+
+// MD5编码
+func MD5(str string) string {
+	h := md5.New()
+	h.Write([]byte(str))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func HmacSHA256(plaintext string, key string) string {
+	hash := hmac.New(sha256.New, []byte(key)) // 创建哈希算法
+	hash.Write([]byte(plaintext))             // 写入数据
+	return fmt.Sprintf("%X", hash.Sum(nil))
+}
+
+func HmacMD5(plaintext string, key string) string {
+	hash := hmac.New(md5.New, []byte(key)) // 创建哈希算法
+	hash.Write([]byte(plaintext))          // 写入数据
+	return fmt.Sprintf("%X", hash.Sum(nil))
 }
 
 // 驼峰式写法转为下划线写法
@@ -288,4 +288,28 @@ func Lcfirst(str string) string {
 		return string(unicode.ToLower(v)) + str[i+1:]
 	}
 	return ""
+}
+
+func ToFloat64Safe(str string) float64 {
+	v, e := strconv.ParseFloat(str, 64)
+	if nil != e {
+		return 0
+	}
+	return v
+}
+
+func ToUint32(str string) (uint32, error) {
+	v, e := strconv.ParseUint(str, 10, 32)
+	if nil != e {
+		return 0, e
+	}
+	return uint32(v), nil
+}
+
+func ToUint32Safe(str string) uint32 {
+	v, e := strconv.ParseUint(str, 10, 32)
+	if nil != e {
+		return 0
+	}
+	return uint32(v)
 }

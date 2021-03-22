@@ -18,35 +18,34 @@
 package global
 
 import (
-	"fmt"
 	"io/ioutil"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
+	"text/template"
 
 	"github.com/juju/errors"
 	"github.com/siddontang/go-mysql/schema"
 	"github.com/vmihailenco/msgpack"
-	lua "github.com/yuin/gopher-lua"
+	"github.com/yuin/gopher-lua"
 	"github.com/yuin/gopher-lua/parse"
 
-	"go-mysql-transfer/util/dateutil"
-	"go-mysql-transfer/util/fileutil"
+	"go-mysql-transfer/model"
+	"go-mysql-transfer/util/dates"
+	"go-mysql-transfer/util/files"
 	"go-mysql-transfer/util/stringutil"
 )
 
 const (
-	RedisStructureString = "1"
-	RedisStructureHash   = "2"
-	RedisStructureList   = "3"
-	RedisStructureSet    = "4"
+	RedisStructureString    = "String"
+	RedisStructureHash      = "Hash"
+	RedisStructureList      = "List"
+	RedisStructureSet       = "Set"
+	RedisStructureSortedSet = "SortedSet"
 
 	ValEncoderJson     = "json"
 	ValEncoderKVCommas = "kv-commas"
 	ValEncoderVCommas  = "v-commas"
-	LeftBrace          = "${"
-	RightBrace         = "}-}+}"
 )
 
 var (
@@ -81,6 +80,8 @@ type Rule struct {
 	DateFormatter     string `yaml:"date_formatter"`     //date类型格式化， 不填写默认2006-01-02
 	DatetimeFormatter string `yaml:"datetime_formatter"` //datetime、timestamp类型格式化，不填写默认RFC3339(2006-01-02T15:04:05Z07:00)
 
+	ReserveRawData bool `yaml:"reserve_raw_data"` // 保留update之前的数据，针对KAFKA、RABBITMQ、ROCKETMQ有效
+
 	// ------------------- REDIS -----------------
 	//对应redis的5种数据类型 String、Hash(字典) 、List(列表) 、Set(集合)、Sorted Set(有序集合)
 	RedisStructure string `yaml:"redis_structure"`
@@ -93,12 +94,14 @@ type Rule struct {
 	RedisHashFieldPrefix string `yaml:"redis_hash_field_prefix"`
 	// 使用哪个列的值作为hash的field，仅redis_structure为hash时起作用
 	RedisHashFieldColumn string `yaml:"redis_hash_field_column"`
-
-	RedisKeyColumnIndex        int
-	RedisKeyColumnIndexs       []int
-	RedisKeyColumnIndexMap     map[string]int
-	RedisHashFieldColumnIndex  int
-	RedisHashFieldColumnIndexs []int
+	// Sorted Set(有序集合)的Score
+	RedisSortedSetScoreColumn      string `yaml:"redis_sorted_set_score_column"`
+	RedisKeyColumnIndex            int
+	RedisKeyColumnIndexs           []int
+	RedisHashFieldColumnIndex      int
+	RedisHashFieldColumnIndexs     []int
+	RedisSortedSetScoreColumnIndex int
+	RedisKeyTmpl                   *template.Template
 
 	// ------------------- ROCKETMQ -----------------
 	RocketmqTopic string `yaml:"rocketmq_topic"` //rocketmq topic名称，可以为空，为空时使用表名称
@@ -115,6 +118,7 @@ type Rule struct {
 
 	// ------------------- ES -----------------
 	ElsIndex   string       `yaml:"es_index"`    //Elasticsearch Index,可以为空，默认使用表(Table)名称
+	ElsType    string       `yaml:"es_type"`     //es6.x以后一个Index只能拥有一个Type,可以为空，默认使用_doc; es7.x版本此属性无效
 	EsMappings []*EsMapping `yaml:"es_mappings"` //Elasticsearch mappings映射关系,可以为空，为空时根据数据类型自己推导
 
 	// --------------- no config ----------------
@@ -122,9 +126,10 @@ type Rule struct {
 	TableColumnSize       int
 	IsCompositeKey        bool //是否联合主键
 	DefaultColumnValueMap map[string]string
-	PaddingMap            map[string]*Padding
+	PaddingMap            map[string]*model.Padding
 	LuaProto              *lua.FunctionProto
 	LuaFunction           *lua.LFunction
+	ValueTmpl             *template.Template
 }
 
 func RuleDeepClone(res *Rule) (*Rule, error) {
@@ -143,7 +148,7 @@ func RuleDeepClone(res *Rule) (*Rule, error) {
 }
 
 func RuleKey(schema string, table string) string {
-	return strings.ToLower(fmt.Sprintf("%s:%s", schema, table))
+	return strings.ToLower(schema + ":" + table)
 }
 
 func AddRuleIns(ruleKey string, r *Rule) {
@@ -190,19 +195,16 @@ func RuleInsList() []*Rule {
 	return list
 }
 
-func StructureName(structure string) string {
-	switch structure {
-	case RedisStructureString:
-		return "string"
-	case RedisStructureHash:
-		return "hash"
-	case RedisStructureList:
-		return "list"
-	case RedisStructureSet:
-		return "set"
+func RuleKeyList() []string {
+	_lockOfRuleInsMap.RLock()
+	defer _lockOfRuleInsMap.RUnlock()
+
+	list := make([]string, 0, len(_ruleInsMap))
+	for k, _ := range _ruleInsMap {
+		list = append(list, k)
 	}
 
-	return ""
+	return list
 }
 
 func (s *Rule) Initialize() error {
@@ -215,7 +217,11 @@ func (s *Rule) Initialize() error {
 	}
 
 	if s.ValueFormatter != "" {
-		s.ValueFormatter = s.rewriteValFormat(s.ValueFormatter)
+		tmpl, err := template.New(s.TableInfo.Name).Parse(s.ValueFormatter)
+		if err != nil {
+			return err
+		}
+		s.ValueTmpl = tmpl
 		s.ValueEncoder = ""
 	}
 
@@ -233,16 +239,12 @@ func (s *Rule) Initialize() error {
 		s.DefaultColumnValueMap = dm
 	}
 
-	if s.DateFormatter == "" {
-		s.DateFormatter = DefaultDateFormatter
-	} else {
-		s.DateFormatter = dateutil.ConvertGoFormat(s.DateFormatter)
+	if s.DateFormatter != "" {
+		s.DateFormatter = dates.ConvertGoFormat(s.DateFormatter)
 	}
 
-	if s.DatetimeFormatter == "" {
-		s.DatetimeFormatter = DefaultDatetimeFormatter
-	} else {
-		s.DatetimeFormatter = dateutil.ConvertGoFormat(s.DatetimeFormatter)
+	if s.DatetimeFormatter != "" {
+		s.DatetimeFormatter = dates.ConvertGoFormat(s.DatetimeFormatter)
 	}
 
 	if _config.IsRedis() {
@@ -278,6 +280,12 @@ func (s *Rule) Initialize() error {
 	if _config.IsEls() {
 		if err := s.initElsConfig(); err != nil {
 			return err
+		}
+	}
+
+	if _config.IsScript() {
+		if s.LuaScript == "" && s.LuaFilePath == "" {
+			return errors.New("empty lua script not allowed")
 		}
 	}
 
@@ -325,11 +333,17 @@ func (s *Rule) AfterUpdateTableInfo() error {
 		}
 	}
 
+	if _config.IsScript() {
+		if s.LuaScript == "" || s.LuaFilePath == "" {
+			return errors.New("empty lua script not allowed")
+		}
+	}
+
 	return nil
 }
 
 func (s *Rule) buildPaddingMap() error {
-	paddingMap := make(map[string]*Padding)
+	paddingMap := make(map[string]*model.Padding)
 	mappings := make(map[string]string)
 
 	if s.ColumnMappingConfigs != "" {
@@ -353,23 +367,6 @@ func (s *Rule) buildPaddingMap() error {
 		for _, mapping := range s.EsMappings {
 			mappings[strings.ToUpper(mapping.Column)] = mapping.Field
 		}
-	}
-
-	if s.ValueFormatter != "" {
-		if r := regexp.MustCompile("\\${[^\\}]+\\}"); r != nil {
-			finds := r.FindAllString(s.ValueFormatter, -1)
-			for _, find := range finds {
-				matched := strings.ReplaceAll(find, "${", "")
-				matched = strings.ReplaceAll(matched, "}", "")
-				_, index := s.TableColumn(matched)
-				if index < 0 {
-					return errors.New("value_formatter must be table column")
-				}
-				paddingMap[matched] = s.newPadding(mappings, matched)
-			}
-		}
-		s.PaddingMap = paddingMap
-		return nil
 	}
 
 	var includes []string
@@ -409,7 +406,7 @@ func (s *Rule) buildPaddingMap() error {
 	return nil
 }
 
-func (s *Rule) newPadding(mappings map[string]string, columnName string) *Padding {
+func (s *Rule) newPadding(mappings map[string]string, columnName string) *model.Padding {
 	column, index := s.TableColumn(columnName)
 
 	wrapName := s.WrapName(column.Name)
@@ -418,7 +415,7 @@ func (s *Rule) newPadding(mappings map[string]string, columnName string) *Paddin
 		wrapName = mapped
 	}
 
-	return &Padding{
+	return &model.Padding{
 		WrapName: wrapName,
 
 		ColumnIndex:    index,
@@ -450,7 +447,7 @@ func (s *Rule) WrapName(fieldName string) string {
 	return fieldName
 }
 
-func (s *Rule) LuaNecessary() bool {
+func (s *Rule) LuaEnable() bool {
 	if s.LuaScript == "" && s.LuaFilePath == "" {
 		return false
 	}
@@ -459,7 +456,7 @@ func (s *Rule) LuaNecessary() bool {
 }
 
 func (s *Rule) initRedisConfig() error {
-	if s.LuaNecessary() {
+	if s.LuaEnable() {
 		return nil
 	}
 
@@ -512,8 +509,21 @@ func (s *Rule) initRedisConfig() error {
 		if s.RedisKeyValue == "" {
 			return errors.New("empty redis_key_value not allowed in rule")
 		}
+	case "SORTEDSET":
+		s.RedisStructure = RedisStructureSortedSet
+		if s.RedisKeyValue == "" {
+			return errors.New("empty redis_key_value not allowed in rule")
+		}
+		if s.RedisSortedSetScoreColumn == "" {
+			return errors.New("empty redis_sorted_set_score_column not allowed in rule")
+		}
+		_, index := s.TableColumn(s.RedisSortedSetScoreColumn)
+		if index < 0 {
+			return errors.New("redis_sorted_set_score_column must be table column")
+		}
+		s.RedisHashFieldColumnIndex = index
 	default:
-		return errors.Errorf(" redis_structure must be string or hash or list or set")
+		return errors.Errorf("redis_structure must be string or hash or list or set")
 	}
 
 	if s.RedisKeyColumn != "" {
@@ -521,37 +531,24 @@ func (s *Rule) initRedisConfig() error {
 		if index < 0 {
 			return errors.New("redis_key_column must be table column")
 		}
-		s.RedisHashFieldColumnIndex = index
+		s.RedisKeyColumnIndex = index
 		s.RedisKeyFormatter = ""
 	}
 
 	if s.RedisKeyFormatter != "" {
-		indexMap := make(map[string]int)
-		reg := regexp.MustCompile("\\{[^\\}]+\\}")
-		if reg != nil {
-			temps := reg.FindAllString(s.RedisKeyFormatter, -1)
-			for _, temp := range temps {
-				columnName := strings.ReplaceAll(temp, "{", "")
-				columnName = strings.ReplaceAll(columnName, "}", "")
-				_, index := s.TableColumn(columnName)
-				if index < 0 {
-					return errors.New("redis_key_formatter must be table column")
-				}
-				indexMap[columnName] = index
-			}
+		tmpl, err := template.New(s.TableInfo.Name).Parse(s.RedisKeyFormatter)
+		if err != nil {
+			return err
 		}
-		if len(indexMap) == 0 {
-			return errors.New("redis_key_formatter error in rule")
-		}
-		s.RedisKeyColumnIndexMap = indexMap
-		s.RedisKeyFormatter = s.rewriteValFormat(s.RedisKeyFormatter)
+		s.RedisKeyTmpl = tmpl
+		s.RedisKeyColumnIndex = -1
 	}
 
 	return nil
 }
 
 func (s *Rule) initRocketConfig() error {
-	if !s.LuaNecessary() {
+	if !s.LuaEnable() {
 		if s.RocketmqTopic == "" {
 			s.RocketmqTopic = s.Table
 		}
@@ -561,7 +558,7 @@ func (s *Rule) initRocketConfig() error {
 }
 
 func (s *Rule) initMongoConfig() error {
-	if !s.LuaNecessary() {
+	if !s.LuaEnable() {
 		if s.MongodbDatabase == "" {
 			return errors.New("empty mongodb_database not allowed in rule")
 		}
@@ -575,7 +572,7 @@ func (s *Rule) initMongoConfig() error {
 }
 
 func (s *Rule) initRabbitmqConfig() error {
-	if !s.LuaNecessary() {
+	if !s.LuaEnable() {
 		if s.RabbitmqQueue == "" {
 			s.RabbitmqQueue = s.Table
 		}
@@ -589,6 +586,10 @@ func (s *Rule) initElsConfig() error {
 		s.ElsIndex = s.Table
 	}
 
+	if s.ElsType == "" {
+		s.ElsType = "_doc"
+	}
+
 	if len(s.EsMappings) > 0 {
 		for _, m := range s.EsMappings {
 			if m.Field == "" {
@@ -597,7 +598,7 @@ func (s *Rule) initElsConfig() error {
 			if m.Type == "" {
 				return errors.New("empty type not allowed in es_mappings")
 			}
-			if m.Column == "" && !s.LuaNecessary() {
+			if m.Column == "" && !s.LuaEnable() {
 				return errors.New("empty column not allowed in es_mappings")
 			}
 		}
@@ -607,7 +608,7 @@ func (s *Rule) initElsConfig() error {
 }
 
 func (s *Rule) initKafkaConfig() error {
-	if !s.LuaNecessary() {
+	if !s.LuaEnable() {
 		if s.KafkaTopic == "" {
 			s.KafkaTopic = s.Table
 		}
@@ -616,23 +617,12 @@ func (s *Rule) initKafkaConfig() error {
 	return nil
 }
 
-func (s *Rule) rewriteValFormat(format string) string {
-	var temp string
-	for _, c := range format {
-		if string(c) == "}" {
-			temp += RightBrace
-		} else {
-			temp += string(c)
-		}
-	}
-	return temp
-}
-
-func (s *Rule) PreCompileLuaScript(dataDir string) error {
+// 编译Lua
+func (s *Rule) CompileLuaScript(dataDir string) error {
 	script := s.LuaScript
 	if s.LuaFilePath != "" {
 		var filePath string
-		if fileutil.IsExist(s.LuaFilePath) {
+		if files.IsExist(s.LuaFilePath) {
 			filePath = s.LuaFilePath
 		} else {
 			filePath = filepath.Join(dataDir, s.LuaFilePath)
@@ -659,9 +649,11 @@ func (s *Rule) PreCompileLuaScript(dataDir string) error {
 			strings.Contains(script, `HSET(`) ||
 			strings.Contains(script, `RPUSH(`) ||
 			strings.Contains(script, `SADD(`) ||
+			strings.Contains(script, `ZADD(`) ||
 			strings.Contains(script, `DEL(`) ||
 			strings.Contains(script, `HDEL(`) ||
 			strings.Contains(script, `LREM(`) ||
+			strings.Contains(script, `ZREM(`) ||
 			strings.Contains(script, `SREM(`)) {
 
 			return errors.New("lua script incorrect format")

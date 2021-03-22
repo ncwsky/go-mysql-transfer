@@ -18,7 +18,6 @@
 package service
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"regexp"
@@ -27,166 +26,186 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/siddontang/go-mysql/canal"
+	"github.com/siddontang/go-mysql/mysql"
 	"go.uber.org/atomic"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/metrics"
 	"go-mysql-transfer/service/endpoint"
 	"go-mysql-transfer/storage"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/util/logs"
 )
 
-const _metricsTaskInterval = 10
+const _transferLoopInterval = 1
 
 type TransferService struct {
-	config          *global.Config
-	canal           *canal.Canal
-	positionStorage storage.PositionStorage
+	canal        *canal.Canal
+	canalCfg     *canal.Config
+	canalHandler *handler
+	canalEnable  atomic.Bool
+	lockOfCanal  sync.Mutex
+	firstsStart  atomic.Bool
 
-	endpoint endpoint.Endpoint
-	handler  *handler
-
-	listenerStarted atomic.Bool
-	running         atomic.Bool
-	wg              sync.WaitGroup
-	ctx             context.Context
-	cancelFunc      context.CancelFunc
+	wg             sync.WaitGroup
+	endpoint       endpoint.Endpoint
+	endpointEnable atomic.Bool
+	positionDao    storage.PositionStorage
+	loopStopSignal chan struct{}
 }
 
 func (s *TransferService) initialize() error {
-	if err := s.initCanal(); err != nil {
+	s.canalCfg = canal.NewDefaultConfig()
+	s.canalCfg.Addr = global.Cfg().Addr
+	s.canalCfg.User = global.Cfg().User
+	s.canalCfg.Password = global.Cfg().Password
+	s.canalCfg.Charset = global.Cfg().Charset
+	s.canalCfg.Flavor = global.Cfg().Flavor
+	s.canalCfg.ServerID = global.Cfg().SlaveID
+	s.canalCfg.Dump.ExecutionPath = global.Cfg().DumpExec
+	s.canalCfg.Dump.DiscardErr = false
+	s.canalCfg.Dump.SkipMasterData = global.Cfg().SkipMasterData
+
+	if err := s.createCanal(); err != nil {
 		return errors.Trace(err)
 	}
 
-	if err := s.initRules(); err != nil {
+	if err := s.completeRules(); err != nil {
 		return errors.Trace(err)
 	}
 
-	// 初始化 endpoint
-	_endpoint := endpoint.NewEndpoint(s.config)
-	if err := _endpoint.Start(); err != nil {
+	s.addDumpDatabaseOrTable()
+
+	positionDao := storage.NewPositionStorage()
+	if err := positionDao.Initialize(); err != nil {
 		return errors.Trace(err)
 	}
-	global.SetDestinationState(global.MetricsStateOK)
-	s.endpoint = _endpoint
+	s.positionDao = positionDao
 
-	s.initDumper()
-
-	s.positionStorage = storage.NewPositionStorage(s.config)
-	if err := s.positionStorage.Initialize(); err != nil {
+	// endpoint
+	endpoint := endpoint.NewEndpoint(s.canal)
+	if err := endpoint.Connect(); err != nil {
 		return errors.Trace(err)
 	}
-
-	s.ctx, s.cancelFunc = context.WithCancel(context.Background())
-
-	s.handler = &handler{
-		requestQueue: make(chan interface{}, 4096),
-		transfer:     s,
+	// 异步，必须要ping下才能确定连接成功
+	if global.Cfg().IsMongodb() {
+		err := endpoint.Ping()
+		if err != nil {
+			return err
+		}
 	}
-	s.canal.SetEventHandler(s.handler)
+	s.endpoint = endpoint
+	s.endpointEnable.Store(true)
+	metrics.SetDestState(metrics.DestStateOK)
+
+	s.firstsStart.Store(true)
+	s.startLoop()
 
 	return nil
 }
 
 func (s *TransferService) run() error {
-	s.wg.Add(1)
-	s.handler.startRequestQueueListener()
-
-	if s.config.IsExporterEnable() {
-		s.startMetricsTask()
-	}
-
-	current, err := s.positionStorage.Get()
+	current, err := s.positionDao.Get()
 	if err != nil {
 		return err
 	}
 
-	logutil.BothInfof("transfer run from pos %s %d", current.Name, current.Pos)
+	s.wg.Add(1)
+	go func(p mysql.Position) {
+		s.canalEnable.Store(true)
+		log.Println(fmt.Sprintf("transfer run from position(%s %d)", p.Name, p.Pos))
+		if err := s.canal.RunFrom(p); err != nil {
+			log.Println(fmt.Sprintf("start transfer : %v", err))
+			logs.Errorf("canal : %v", errors.ErrorStack(err))
+			if s.canalHandler != nil {
+				s.canalHandler.stopListener()
+			}
+			s.canalEnable.Store(false)
+		}
 
-	s.running.Store(true)
-	if err := s.canal.RunFrom(current); err != nil {
-		log.Println(fmt.Sprintf("start transfer : %v", err))
-		logutil.Errorf("start transfer : %v", err)
-		s.cancelFunc()
-		return errors.Trace(err)
-	}
+		logs.Info("Canal is Closed")
+		s.canalEnable.Store(false)
+		s.canal = nil
+		s.wg.Done()
+	}(current)
 
-	s.running.Store(false)
-	logutil.Info("Canal is Closed")
+	// canal未提供回调，停留一秒，确保RunFrom启动成功
+	time.Sleep(time.Second)
 	return nil
 }
 
-func (s *TransferService) Pause() {
-	if s.running.Load() {
-		logutil.BothInfof("transfer paused !!!")
-		s.canal.Close()
-		s.canal = nil
-		s.running.Store(false)
-	}
-}
+func (s *TransferService) StartUp() {
+	s.lockOfCanal.Lock()
+	defer s.lockOfCanal.Unlock()
 
-func (s *TransferService) Restart() {
-	if s.listenerStarted.Load() {
-		if s.canal == nil {
-			logutil.BothInfof("transfer rerun !!!")
-			go s.rerun()
-		}
+	if s.firstsStart.Load() {
+		s.canalHandler = newHandler()
+		s.canal.SetEventHandler(s.canalHandler)
+		s.canalHandler.startListener()
+		s.firstsStart.Store(false)
+		s.run()
 	} else {
-		logutil.BothInfof("transfer run !!!")
-		go s.run()
+		s.restart()
 	}
 }
 
-func (s *TransferService) rerun() {
-	s.initCanal()
-	s.initDumper()
-	s.canal.SetEventHandler(s.handler)
-	s.running.Store(true)
-
-	current, _ := s.positionStorage.Get()
-	logutil.Infof("TransferService Restart! ,Position: %s-%d", current.Name, current.Pos)
-	if err := s.canal.RunFrom(current); err != nil {
-		logutil.Errorf("start transfer err %v", err)
-	}
-}
-
-func (s *TransferService) close() {
-	logutil.Infof("closing transfer")
-
-	s.cancelFunc()
-
+func (s *TransferService) restart() {
 	if s.canal != nil {
 		s.canal.Close()
+		s.wg.Wait()
 	}
 
-	s.endpoint.Close()
-
-	s.wg.Wait()
+	s.createCanal()
+	s.addDumpDatabaseOrTable()
+	s.canalHandler = newHandler()
+	s.canal.SetEventHandler(s.canalHandler)
+	s.canalHandler.startListener()
+	s.run()
 }
 
-func (s *TransferService) initCanal() error {
-	cfg := canal.NewDefaultConfig()
-	cfg.Addr = s.config.Addr
-	cfg.User = s.config.User
-	cfg.Password = s.config.Password
-	cfg.Charset = s.config.Charset
-	cfg.Flavor = s.config.Flavor
-	cfg.ServerID = s.config.SlaveID
-	cfg.Dump.ExecutionPath = s.config.DumpExec
-	cfg.Dump.DiscardErr = false
-	cfg.Dump.SkipMasterData = s.config.SkipMasterData
+func (s *TransferService) stopDump() {
+	s.lockOfCanal.Lock()
+	defer s.lockOfCanal.Unlock()
 
-	for _, s := range s.config.RuleConfigs {
-		cfg.IncludeTableRegex = append(cfg.IncludeTableRegex, s.Schema+"\\."+s.Table)
+	if s.canal == nil {
+		return
 	}
 
+	if !s.canalEnable.Load() {
+		return
+	}
+
+	if s.canalHandler != nil {
+		s.canalHandler.stopListener()
+		s.canalHandler = nil
+	}
+
+	s.canal.Close()
+	s.wg.Wait()
+
+	log.Println("dumper stopped")
+}
+
+func (s *TransferService) Close() {
+	s.stopDump()
+	s.loopStopSignal <- struct{}{}
+}
+
+func (s *TransferService) Position() (mysql.Position, error) {
+	return s.positionDao.Get()
+}
+
+func (s *TransferService) createCanal() error {
+	for _, rc := range global.Cfg().RuleConfigs {
+		s.canalCfg.IncludeTableRegex = append(s.canalCfg.IncludeTableRegex, rc.Schema+"\\."+rc.Table)
+	}
 	var err error
-	s.canal, err = canal.NewCanal(cfg)
+	s.canal, err = canal.NewCanal(s.canalCfg)
 	return errors.Trace(err)
 }
 
-func (s *TransferService) initRules() error {
+func (s *TransferService) completeRules() error {
 	wildcards := make(map[string]bool)
-	for _, rc := range s.config.RuleConfigs {
+	for _, rc := range global.Cfg().RuleConfigs {
 		if rc.Table == "*" {
 			return errors.Errorf("wildcard * is not allowed for table name")
 		}
@@ -232,7 +251,7 @@ func (s *TransferService) initRules() error {
 			return errors.Trace(err)
 		}
 		if len(tableMata.PKColumns) == 0 {
-			if !s.config.SkipNoPkTable {
+			if !global.Cfg().SkipNoPkTable {
 				return errors.Errorf("%s.%s must have a PK for a column", rule.Schema, rule.Table)
 			}
 		}
@@ -246,8 +265,8 @@ func (s *TransferService) initRules() error {
 			return errors.Trace(err)
 		}
 
-		if rule.LuaNecessary() {
-			if err := rule.PreCompileLuaScript(s.config.DataDir); err != nil {
+		if rule.LuaEnable() {
+			if err := rule.CompileLuaScript(global.Cfg().DataDir); err != nil {
 				return err
 			}
 		}
@@ -256,7 +275,7 @@ func (s *TransferService) initRules() error {
 	return nil
 }
 
-func (s *TransferService) initDumper() {
+func (s *TransferService) addDumpDatabaseOrTable() {
 	var schema string
 	schemas := make(map[string]int)
 	tables := make([]string, 0, global.RuleInsTotal())
@@ -285,7 +304,7 @@ func (s *TransferService) updateRule(schema, table string) error {
 		}
 
 		if len(tableInfo.PKColumns) == 0 {
-			if !s.config.SkipNoPkTable {
+			if !global.Cfg().SkipNoPkTable {
 				return errors.Errorf("%s.%s must have a PK for a column", rule.Schema, rule.Table)
 			}
 		}
@@ -306,18 +325,30 @@ func (s *TransferService) updateRule(schema, table string) error {
 	return nil
 }
 
-func (s *TransferService) startMetricsTask() {
-	ticker := time.NewTicker(_metricsTaskInterval * time.Second)
+func (s *TransferService) startLoop() {
 	go func() {
+		ticker := time.NewTicker(_transferLoopInterval * time.Second)
+		defer ticker.Stop()
 		for {
-			<-ticker.C
-			if err := s.endpoint.Ping(); err != nil {
-				global.SetDestinationState(global.MetricsStateNO)
-			} else {
-				global.SetDestinationState(global.MetricsStateOK)
+			select {
+			case <-ticker.C:
+				if !s.endpointEnable.Load() {
+					err := s.endpoint.Ping()
+					if err != nil {
+						log.Println("destination not available,see the log file for details")
+						logs.Error(err.Error())
+					} else {
+						s.endpointEnable.Store(true)
+						if global.Cfg().IsRabbitmq() {
+							s.endpoint.Connect()
+						}
+						s.StartUp()
+						metrics.SetDestState(metrics.DestStateOK)
+					}
+				}
+			case <-s.loopStopSignal:
+				return
 			}
-
-			global.SetTransferDelay(s.canal.GetDelay())
 		}
 	}()
 }

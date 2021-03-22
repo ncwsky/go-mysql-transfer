@@ -18,56 +18,56 @@
 package endpoint
 
 import (
-	"fmt"
+	"bytes"
+	"log"
 	"strings"
+	"sync"
 
 	"github.com/go-redis/redis"
 	"github.com/pingcap/errors"
 	"github.com/siddontang/go-mysql/canal"
-	"github.com/vmihailenco/msgpack"
+	"github.com/siddontang/go-mysql/mysql"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/metrics"
+	"go-mysql-transfer/model"
 	"go-mysql-transfer/service/luaengine"
-	"go-mysql-transfer/storage"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/util/logs"
 	"go-mysql-transfer/util/stringutil"
 )
 
 type RedisEndpoint struct {
-	config *global.Config
-	cached *storage.BoltRowStorage
-
 	isCluster bool
 	client    *redis.Client
 	cluster   *redis.ClusterClient
+	retryLock sync.Mutex
 }
 
-func newRedisEndpoint(c *global.Config) *RedisEndpoint {
+func newRedisEndpoint() *RedisEndpoint {
+	cfg := global.Cfg()
 	r := &RedisEndpoint{}
-	r.config = c
-	r.cached = &storage.BoltRowStorage{}
 
-	list := strings.Split(c.RedisAddr, ",")
+	list := strings.Split(cfg.RedisAddr, ",")
 	if len(list) == 1 {
 		r.client = redis.NewClient(&redis.Options{
-			Addr:     c.RedisAddr,
-			Password: c.RedisPass,
-			DB:       c.RedisDatabase,
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPass,
+			DB:       cfg.RedisDatabase,
 		})
 	} else {
-		if c.RedisGroupType == global.RedisGroupTypeSentinel {
+		if cfg.RedisGroupType == global.RedisGroupTypeSentinel {
 			r.client = redis.NewFailoverClient(&redis.FailoverOptions{
-				MasterName:    c.RedisMasterName,
+				MasterName:    cfg.RedisMasterName,
 				SentinelAddrs: list,
-				Password:      c.RedisPass,
-				DB:            c.RedisDatabase,
+				Password:      cfg.RedisPass,
+				DB:            cfg.RedisDatabase,
 			})
 		}
-		if c.RedisGroupType == global.RedisGroupTypeCluster {
+		if cfg.RedisGroupType == global.RedisGroupTypeCluster {
 			r.isCluster = true
 			r.cluster = redis.NewClusterClient(&redis.ClusterOptions{
 				Addrs:    list,
-				Password: c.RedisPass,
+				Password: cfg.RedisPass,
 			})
 		}
 	}
@@ -75,7 +75,7 @@ func newRedisEndpoint(c *global.Config) *RedisEndpoint {
 	return r
 }
 
-func (s *RedisEndpoint) Start() error {
+func (s *RedisEndpoint) Connect() error {
 	return s.Ping()
 }
 
@@ -96,103 +96,86 @@ func (s *RedisEndpoint) pipe() redis.Pipeliner {
 	} else {
 		pipe = s.client.Pipeline()
 	}
-
 	return pipe
 }
 
-func (s *RedisEndpoint) Consume(rows []*global.RowRequest) {
-	if err := s.doRetryTask(); err != nil {
-		logutil.Error(err.Error())
-		pushFailedRows(rows, s.cached)
-		return
-	}
-
-	expect := true
+func (s *RedisEndpoint) Consume(from mysql.Position, rows []*model.RowRequest) error {
 	pipe := s.pipe()
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		exportActionNum(row.Action, row.RuleKey)
+		metrics.UpdateActionNum(row.Action, row.RuleKey)
 
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(row, rule, true)
-			ls, err := luaengine.DoRedisOps(kvm, row.Action, rule)
+		if rule.LuaEnable() {
+			var err error
+			var ls []*model.RedisRespond
+			kvm := rowMap(row, rule, true)
+			if row.Action == canal.UpdateAction {
+				previous := oldRowMap(row, rule, true)
+				ls, err = luaengine.DoRedisOps(kvm, previous, row.Action, rule)
+			} else {
+				ls, err = luaengine.DoRedisOps(kvm, nil, row.Action, rule)
+			}
 			if err != nil {
-				logutil.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
-				expect = false
-				break
+				log.Println("Lua 脚本执行失败!!! ,详情请参见日志")
+				return errors.Errorf("Lua 脚本执行失败 : %s ", errors.ErrorStack(err))
 			}
 			for _, resp := range ls {
 				s.preparePipe(resp, pipe)
-
-				logutil.Infof("action: %s, structure: %s ,key: %s ,field: %s, value: %v",
-					resp.Action, global.StructureName(resp.Structure), resp.Key, resp.Field, resp.Val)
-
-				global.RedisRespondPool.Put(resp)
+				logs.Infof("action: %s, structure: %s ,key: %s ,field: %s, value: %v", resp.Action, resp.Structure, resp.Key, resp.Field, resp.Val)
 			}
+			kvm = nil
 		} else {
 			resp := s.ruleRespond(row, rule)
 			s.preparePipe(resp, pipe)
-
-			logutil.Infof("action: %s, structure: %s ,key: %s ,field: %s, value: %v",
-				resp.Action, global.StructureName(resp.Structure), resp.Key, resp.Field, resp.Val)
-
-			global.RedisRespondPool.Put(resp)
+			logs.Infof("action: %s, structure: %s ,key: %s ,field: %s, value: %v", resp.Action, resp.Structure, resp.Key, resp.Field, resp.Val)
 		}
-
-		global.RowRequestPool.Put(row)
 	}
 
 	_, err := pipe.Exec()
 	if err != nil {
-		logutil.Error(errors.ErrorStack(err))
-		expect = false
+		return err
 	}
 
-	if !expect {
-		pushFailedRows(rows, s.cached)
-	} else {
-		logutil.Infof("处理完成 %d 条数据", len(rows))
-	}
+	logs.Infof("处理完成 %d 条数据", len(rows))
+	return nil
 }
 
-func (s *RedisEndpoint) Stock(rows []*global.RowRequest) int64 {
+func (s *RedisEndpoint) Stock(rows []*model.RowRequest) int64 {
 	pipe := s.pipe()
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(row, rule, true)
-			ls, err := luaengine.DoRedisOps(kvm, row.Action, rule)
+		if rule.LuaEnable() {
+			kvm := rowMap(row, rule, true)
+			ls, err := luaengine.DoRedisOps(kvm, nil, row.Action, rule)
 			if err != nil {
-				logutil.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
+				logs.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
 				break
 			}
 			for _, resp := range ls {
 				s.preparePipe(resp, pipe)
-				global.RedisRespondPool.Put(resp)
 			}
 		} else {
 			resp := s.ruleRespond(row, rule)
 			resp.Action = row.Action
 			resp.Structure = rule.RedisStructure
 			s.preparePipe(resp, pipe)
-			global.RedisRespondPool.Put(resp)
 		}
 	}
 
 	var counter int64
 	res, err := pipe.Exec()
 	if err != nil {
-		logutil.Error(err.Error())
+		logs.Error(err.Error())
 	}
 
 	for _, re := range res {
@@ -204,24 +187,42 @@ func (s *RedisEndpoint) Stock(rows []*global.RowRequest) int64 {
 	return counter
 }
 
-func (s *RedisEndpoint) ruleRespond(row *global.RowRequest, rule *global.Rule) *global.RedisRespond {
-	resp := global.RedisRespondPool.Get().(*global.RedisRespond)
+func (s *RedisEndpoint) ruleRespond(row *model.RowRequest, rule *global.Rule) *model.RedisRespond {
+	resp := new(model.RedisRespond)
 	resp.Action = row.Action
 	resp.Structure = rule.RedisStructure
 
-	kvm := keyValueMap(row, rule, false)
+	kvm := rowMap(row, rule, false)
 	resp.Key = s.encodeKey(row, rule)
 	if resp.Structure == global.RedisStructureHash {
 		resp.Field = s.encodeHashField(row, rule)
 	}
-	if resp.Action != canal.DeleteAction {
-		resp.Val = encodeStringValue(rule, kvm)
+	if resp.Structure == global.RedisStructureSortedSet {
+		resp.Score = s.encodeSortedSetScoreField(row, rule)
+	}
+
+	if resp.Action == canal.InsertAction {
+		resp.Val = encodeValue(rule, kvm)
+	} else if resp.Action == canal.UpdateAction {
+		if rule.RedisStructure == global.RedisStructureList ||
+			rule.RedisStructure == global.RedisStructureSet ||
+			rule.RedisStructure == global.RedisStructureSortedSet {
+			oldKvm := oldRowMap(row, rule, false)
+			resp.OldVal = encodeValue(rule, oldKvm)
+		}
+		resp.Val = encodeValue(rule, kvm)
+	} else {
+		if rule.RedisStructure == global.RedisStructureList ||
+			rule.RedisStructure == global.RedisStructureSet ||
+			rule.RedisStructure == global.RedisStructureSortedSet {
+			resp.Val = encodeValue(rule, kvm)
+		}
 	}
 
 	return resp
 }
 
-func (s *RedisEndpoint) preparePipe(resp *global.RedisRespond, pipe redis.Cmdable) {
+func (s *RedisEndpoint) preparePipe(resp *model.RedisRespond, pipe redis.Cmdable) {
 	switch resp.Structure {
 	case global.RedisStructureString:
 		if resp.Action == canal.DeleteAction {
@@ -238,166 +239,57 @@ func (s *RedisEndpoint) preparePipe(resp *global.RedisRespond, pipe redis.Cmdabl
 	case global.RedisStructureList:
 		if resp.Action == canal.DeleteAction {
 			pipe.LRem(resp.Key, 0, resp.Val)
+		} else if resp.Action == canal.UpdateAction {
+			pipe.LRem(resp.Key, 0, resp.OldVal)
+			pipe.RPush(resp.Key, resp.Val)
 		} else {
 			pipe.RPush(resp.Key, resp.Val)
 		}
 	case global.RedisStructureSet:
 		if resp.Action == canal.DeleteAction {
 			pipe.SRem(resp.Key, resp.Val)
+		} else if resp.Action == canal.UpdateAction {
+			pipe.SRem(resp.Key, 0, resp.OldVal)
+			pipe.SAdd(resp.Key, resp.Val)
 		} else {
 			pipe.SAdd(resp.Key, resp.Val)
 		}
+	case global.RedisStructureSortedSet:
+		if resp.Action == canal.DeleteAction {
+			pipe.ZRem(resp.Key, resp.Val)
+		} else if resp.Action == canal.UpdateAction {
+			pipe.ZRem(resp.Key, 0, resp.OldVal)
+			val := redis.Z{Score: resp.Score, Member: resp.Val}
+			pipe.ZAdd(resp.Key, val)
+		} else {
+			val := redis.Z{Score: resp.Score, Member: resp.Val}
+			pipe.ZAdd(resp.Key, val)
+		}
 	}
 }
 
-func (s *RedisEndpoint) doCmd(resp *global.RedisRespond) error {
-	var cmd redis.Cmdable
-	if s.isCluster {
-		cmd = s.cluster
-	} else {
-		cmd = s.client
+func (s *RedisEndpoint) encodeKey(req *model.RowRequest, rule *global.Rule) string {
+	if rule.RedisKeyValue != "" {
+		return rule.RedisKeyValue
 	}
 
-	switch resp.Structure {
-	case global.RedisStructureString:
-		if resp.Action == canal.DeleteAction {
-			r := cmd.Del(resp.Key)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		} else {
-			r := cmd.Set(resp.Key, resp.Val, 0)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		}
-	case global.RedisStructureHash:
-		if resp.Action == canal.DeleteAction {
-			r := cmd.HDel(resp.Key, resp.Field)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		} else {
-			r := cmd.HSet(resp.Key, resp.Field, resp.Val)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		}
-	case global.RedisStructureList:
-		if resp.Action == canal.DeleteAction {
-			r := cmd.LRem(resp.Key, 0, resp.Val)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		} else {
-			r := cmd.RPush(resp.Key, resp.Val)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		}
-	case global.RedisStructureSet:
-		if resp.Action == canal.DeleteAction {
-			r := cmd.SRem(resp.Key, resp.Val)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		} else {
-			r := cmd.SAdd(resp.Key, resp.Val)
-			if r.Err() != nil {
-				return r.Err()
-			}
-		}
-	}
-
-	return nil
-}
-
-func (s *RedisEndpoint) doRetryTask() error {
-	if s.cached.Size() == 0 {
-		return nil
-	}
-
-	if err := s.Ping(); err != nil {
-		return err
-	}
-
-	logutil.Infof("当前重试队列有%d 条数据", s.cached.Size())
-
-	var data []byte
-	ids := s.cached.IdList()
-	for _, id := range ids {
-		var err error
-		data, err = s.cached.Get(id)
-		if err != nil {
-			logutil.Warn(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		var row global.RowRequest
-		err = msgpack.Unmarshal(data, &row)
-		if err != nil {
-			logutil.Warn(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		rule, _ := global.RuleIns(row.RuleKey)
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(&row, rule, true)
-			ls, err := luaengine.DoRedisOps(kvm, row.Action, rule)
-			if err != nil {
-				return errors.New(fmt.Sprintf("lua 脚本执行失败 : %s ", errors.ErrorStack(err)))
-			}
-			for _, resp := range ls {
-				err = s.doCmd(resp)
-
-				logutil.Infof("retry: action: %s, structure: %s ,key: %s ,field: %s, value: %v",
-					resp.Action, global.StructureName(resp.Structure), resp.Key, resp.Field, resp.Val)
-
-				global.RedisRespondPool.Put(resp)
-				if err != nil {
-					return err
-				}
-			}
-		} else {
-			resp := s.ruleRespond(&row, rule)
-			err = s.doCmd(resp)
-
-			logutil.Infof("retry: action: %s, structure: %s ,key: %s ,field: %s, value: %v",
-				resp.Action, global.StructureName(resp.Structure), resp.Key, resp.Field, resp.Val)
-
-			global.RedisRespondPool.Put(resp)
-			if err != nil {
-				return err
-			}
-		}
-
-		logutil.Infof("cached id :%d , 数据重试成功", id)
-		s.cached.Delete(id)
-	}
-
-	return nil
-}
-
-func (s *RedisEndpoint) encodeKey(re *global.RowRequest, rule *global.Rule) string {
-	var key string
 	if rule.RedisKeyFormatter != "" {
-		for column, index := range rule.RedisKeyColumnIndexMap {
-			val := stringutil.ToString(re.Row[index])
-			temp := rule.RedisKeyFormatter
-			temp = strings.ReplaceAll(temp, global.LeftBrace+column+global.RightBrace, val)
-			key = temp
+		kv := rowMap(req, rule, true)
+		var tmplBytes bytes.Buffer
+		err := rule.RedisKeyTmpl.Execute(&tmplBytes, kv)
+		if err != nil {
+			return ""
 		}
-		return key
+		return tmplBytes.String()
 	}
 
+	var key string
 	if rule.RedisKeyColumnIndex < 0 {
 		for _, v := range rule.RedisKeyColumnIndexs {
-			key += stringutil.ToString(re.Row[v])
+			key += stringutil.ToString(req.Row[v])
 		}
 	} else {
-		key = stringutil.ToString(re.Row[rule.RedisKeyColumnIndex])
+		key = stringutil.ToString(req.Row[rule.RedisKeyColumnIndex])
 	}
 	if rule.RedisKeyPrefix != "" {
 		key = rule.RedisKeyPrefix + key
@@ -406,15 +298,15 @@ func (s *RedisEndpoint) encodeKey(re *global.RowRequest, rule *global.Rule) stri
 	return key
 }
 
-func (s *RedisEndpoint) encodeHashField(re *global.RowRequest, rule *global.Rule) string {
+func (s *RedisEndpoint) encodeHashField(req *model.RowRequest, rule *global.Rule) string {
 	var field string
 
 	if rule.RedisHashFieldColumnIndex < 0 {
 		for _, v := range rule.RedisHashFieldColumnIndexs {
-			field += stringutil.ToString(re.Row[v])
+			field += stringutil.ToString(req.Row[v])
 		}
 	} else {
-		field = stringutil.ToString(re.Row[rule.RedisHashFieldColumnIndex])
+		field = stringutil.ToString(req.Row[rule.RedisHashFieldColumnIndex])
 	}
 
 	if rule.RedisHashFieldPrefix != "" {
@@ -422,6 +314,16 @@ func (s *RedisEndpoint) encodeHashField(re *global.RowRequest, rule *global.Rule
 	}
 
 	return field
+}
+
+func (s *RedisEndpoint) encodeSortedSetScoreField(req *model.RowRequest, rule *global.Rule) float64 {
+	obj := req.Row[rule.RedisHashFieldColumnIndex]
+	if obj == nil {
+		return 0
+	}
+
+	str := stringutil.ToString(obj)
+	return stringutil.ToFloat64Safe(str)
 }
 
 func (s *RedisEndpoint) Close() {

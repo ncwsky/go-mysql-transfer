@@ -19,57 +19,61 @@ package endpoint
 
 import (
 	"context"
+	"log"
 	"strings"
 	"sync"
 
 	"github.com/juju/errors"
 	"github.com/siddontang/go-mysql/canal"
-	"github.com/vmihailenco/msgpack"
+	"github.com/siddontang/go-mysql/mysql"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/metrics"
+	"go-mysql-transfer/model"
 	"go-mysql-transfer/service/luaengine"
-	"go-mysql-transfer/storage"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/util/logs"
 	"go-mysql-transfer/util/stringutil"
 )
 
-type MongoEndpoint struct {
-	config *global.Config
-	cached *storage.BoltRowStorage
+type cKey struct {
+	database   string
+	collection string
+}
 
+type MongoEndpoint struct {
 	options     *options.ClientOptions
 	client      *mongo.Client
 	lock        sync.Mutex
-	collections map[string]*mongo.Collection
+	collections map[cKey]*mongo.Collection
+	collLock    sync.RWMutex
+
+	retryLock sync.Mutex
 }
 
-func newMongoEndpoint(c *global.Config) *MongoEndpoint {
-	addrList := strings.Split(c.MongodbAddr, ",")
+func newMongoEndpoint() *MongoEndpoint {
+	addrList := strings.Split(global.Cfg().MongodbAddr, ",")
 	opts := &options.ClientOptions{
 		Hosts: addrList,
 	}
 
-	if c.MongodbUsername != "" && c.MongodbPassword != "" {
+	if global.Cfg().MongodbUsername != "" && global.Cfg().MongodbPassword != "" {
 		opts.Auth = &options.Credential{
-			Username: c.MongodbUsername,
-			Password: c.MongodbPassword,
+			Username: global.Cfg().MongodbUsername,
+			Password: global.Cfg().MongodbPassword,
 		}
 	}
 
 	r := &MongoEndpoint{}
-	r.config = c
-	r.cached = &storage.BoltRowStorage{}
 	r.options = opts
-	r.collections = make(map[string]*mongo.Collection)
-
+	r.collections = make(map[cKey]*mongo.Collection)
 	return r
 }
 
-func (s *MongoEndpoint) Start() error {
+func (s *MongoEndpoint) Connect() error {
 	client, err := mongo.Connect(context.Background(), s.options)
 	if err != nil {
 		return err
@@ -77,10 +81,12 @@ func (s *MongoEndpoint) Start() error {
 
 	s.client = client
 
+	s.collLock.Lock()
 	for _, rule := range global.RuleInsList() {
 		cc := s.client.Database(rule.MongodbDatabase).Collection(rule.MongodbCollection)
 		s.collections[s.collectionKey(rule.MongodbDatabase, rule.MongodbCollection)] = cc
 	}
+	s.collLock.Unlock()
 
 	return nil
 }
@@ -93,49 +99,46 @@ func (s *MongoEndpoint) isDuplicateKeyError(stack string) bool {
 	return strings.Contains(stack, "E11000 duplicate key error")
 }
 
-func (s *MongoEndpoint) collectionKey(database, collection string) string {
-	return database + "-*|*-" + collection
+func (s *MongoEndpoint) collectionKey(database, collection string) cKey {
+	return cKey{
+		database:   database,
+		collection: collection,
+	}
 }
 
-func (s *MongoEndpoint) collection(key string) *mongo.Collection {
-	collection, exist := s.collections[key]
-	if !exist {
-		index := strings.Index(key, "-*|*-")
-		db := key[0:index]
-		cc := key[index+5 : len(key)]
-		collection = s.client.Database(db).Collection(cc)
-		s.collections[key] = collection
+func (s *MongoEndpoint) collection(key cKey) *mongo.Collection {
+	s.collLock.RLock()
+	c, ok := s.collections[key]
+	s.collLock.RUnlock()
+	if ok {
+		return c
 	}
-	return collection
+
+	s.collLock.Lock()
+	c = s.client.Database(key.database).Collection(key.collection)
+	s.collections[key] = c
+	s.collLock.Unlock()
+
+	return c
 }
 
-func (s *MongoEndpoint) Consume(rows []*global.RowRequest) {
-	if err := s.doRetryTask(); err != nil {
-		logutil.Error(err.Error())
-		pushFailedRows(rows, s.cached)
-		return
-	}
-
-	expect := true
-	models := make(map[string][]mongo.WriteModel, 0)
+func (s *MongoEndpoint) Consume(from mysql.Position, rows []*model.RowRequest) error {
+	models := make(map[cKey][]mongo.WriteModel, 0)
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		exportActionNum(row.Action, row.RuleKey)
+		metrics.UpdateActionNum(row.Action, row.RuleKey)
 
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(row, rule, true)
+		if rule.LuaEnable() {
+			kvm := rowMap(row, rule, true)
 			ls, err := luaengine.DoMongoOps(kvm, row.Action, rule)
 			if err != nil {
-				logutil.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
-				expect = false
-				break
+				return errors.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
 			}
-
 			for _, resp := range ls {
 				var model mongo.WriteModel
 				switch resp.Action {
@@ -143,23 +146,25 @@ func (s *MongoEndpoint) Consume(rows []*global.RowRequest) {
 					model = mongo.NewInsertOneModel().SetDocument(resp.Table)
 				case canal.UpdateAction:
 					model = mongo.NewUpdateOneModel().SetFilter(bson.M{"_id": resp.Id}).SetUpdate(bson.M{"$set": resp.Table})
+				case global.UpsertAction:
+					model = mongo.NewUpdateOneModel().SetFilter(bson.M{"_id": resp.Id}).SetUpsert(true).SetUpdate(bson.M{"$set": resp.Table})
 				case canal.DeleteAction:
 					model = mongo.NewDeleteOneModel().SetFilter(bson.M{"_id": resp.Id})
 				}
 
-				ccKey := s.collectionKey(rule.MongodbDatabase, resp.Collection)
-				array, ok := models[ccKey]
+				key := s.collectionKey(rule.MongodbDatabase, resp.Collection)
+				array, ok := models[key]
 				if !ok {
 					array = make([]mongo.WriteModel, 0)
 				}
 
-				logutil.Infof("action:%s, collection:%s, id:%v, data:%v", resp.Action, resp.Collection, resp.Id, resp.Table)
+				logs.Infof("action:%s, collection:%s, id:%v, data:%v", resp.Action, resp.Collection, resp.Id, resp.Table)
 
 				array = append(array, model)
-				models[ccKey] = array
+				models[key] = array
 			}
 		} else {
-			kvm := keyValueMap(row, rule, false)
+			kvm := rowMap(row, rule, false)
 			id := primaryKey(row, rule)
 			kvm["_id"] = id
 			var model mongo.WriteModel
@@ -178,17 +183,11 @@ func (s *MongoEndpoint) Consume(rows []*global.RowRequest) {
 				array = make([]mongo.WriteModel, 0)
 			}
 
-			logutil.Infof("action:%s, collection:%s, id:%v, data:%v", row.Action, rule.MongodbCollection, id, kvm)
+			logs.Infof("action:%s, collection:%s, id:%v, data:%v", row.Action, rule.MongodbCollection, id, kvm)
 
 			array = append(array, model)
 			models[ccKey] = array
 		}
-	}
-
-	if !expect {
-		pushFailedRows(rows, s.cached)
-		logutil.Infof("%d 条数据处理失败，插入重试队列", len(rows))
-		return
 	}
 
 	var slowly bool
@@ -199,47 +198,43 @@ func (s *MongoEndpoint) Consume(rows []*global.RowRequest) {
 			if s.isDuplicateKeyError(err.Error()) {
 				slowly = true
 			} else {
-				expect = false
+				return err
 			}
-			logutil.Error(errors.ErrorStack(err))
+			logs.Error(errors.ErrorStack(err))
 			break
 		}
 	}
-
 	if slowly {
 		_, err := s.doConsumeSlowly(rows)
 		if err != nil {
-			logutil.Warnf(err.Error())
-			expect = false
+			return err
 		}
 	}
 
-	if !expect {
-		pushFailedRows(rows, s.cached)
-		logutil.Infof("%d 条数据处理失败，插入重试队列", len(rows))
-	} else {
-		logutil.Infof("处理完成 %d 条数据", len(rows))
-	}
+	logs.Infof("处理完成 %d 条数据", len(rows))
+	return nil
 }
 
-func (s *MongoEndpoint) Stock(rows []*global.RowRequest) int64 {
+func (s *MongoEndpoint) Stock(rows []*model.RowRequest) int64 {
 	expect := true
-	models := make(map[string][]mongo.WriteModel, 0)
+	models := make(map[cKey][]mongo.WriteModel, 0)
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(row, rule, true)
+		if rule.LuaEnable() {
+			kvm := rowMap(row, rule, true)
 			ls, err := luaengine.DoMongoOps(kvm, row.Action, rule)
 			if err != nil {
-				logutil.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
+				log.Println("Lua 脚本执行失败!!! ,详情请参见日志")
+				logs.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
 				expect = false
 				break
 			}
+
 			for _, resp := range ls {
 				ccKey := s.collectionKey(rule.MongodbDatabase, resp.Collection)
 				model := mongo.NewInsertOneModel().SetDocument(resp.Table)
@@ -251,7 +246,7 @@ func (s *MongoEndpoint) Stock(rows []*global.RowRequest) int64 {
 				models[ccKey] = array
 			}
 		} else {
-			kvm := keyValueMap(row, rule, false)
+			kvm := rowMap(row, rule, false)
 			id := primaryKey(row, rule)
 			kvm["_id"] = id
 
@@ -279,17 +274,17 @@ func (s *MongoEndpoint) Stock(rows []*global.RowRequest) int64 {
 			if s.isDuplicateKeyError(err.Error()) {
 				slowly = true
 			}
-			logutil.Error(errors.ErrorStack(err))
+			logs.Error(errors.ErrorStack(err))
 			break
 		}
 		sum += rr.InsertedCount
 	}
 
 	if slowly {
-		logutil.Info("do consume slowly ... ... ")
+		logs.Info("do consume slowly ... ... ")
 		slowlySum, err := s.doConsumeSlowly(rows)
 		if err != nil {
-			logutil.Warnf(err.Error())
+			logs.Warnf(err.Error())
 		}
 		return slowlySum
 	}
@@ -297,20 +292,20 @@ func (s *MongoEndpoint) Stock(rows []*global.RowRequest) int64 {
 	return sum
 }
 
-func (s *MongoEndpoint) doConsumeSlowly(rows []*global.RowRequest) (int64, error) {
+func (s *MongoEndpoint) doConsumeSlowly(rows []*model.RowRequest) (int64, error) {
 	var sum int64
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(row, rule, true)
+		if rule.LuaEnable() {
+			kvm := rowMap(row, rule, true)
 			ls, err := luaengine.DoMongoOps(kvm, row.Action, rule)
 			if err != nil {
-				logutil.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
+				logs.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
 				return sum, err
 			}
 			for _, resp := range ls {
@@ -320,13 +315,13 @@ func (s *MongoEndpoint) doConsumeSlowly(rows []*global.RowRequest) (int64, error
 					_, err := collection.InsertOne(context.Background(), resp.Table)
 					if err != nil {
 						if s.isDuplicateKeyError(err.Error()) {
-							logutil.Warnf("duplicate key [ %v ]", stringutil.ToJsonString(resp.Table))
+							logs.Warnf("duplicate key [ %v ]", stringutil.ToJsonString(resp.Table))
 						} else {
 							return sum, err
 						}
 					}
 				case canal.UpdateAction:
-					_, err := collection.UpdateOne(context.Background(), bson.M{"_id": resp.Id}, resp.Table)
+					_, err := collection.UpdateOne(context.Background(), bson.M{"_id": resp.Id}, bson.M{"$set": resp.Table})
 					if err != nil {
 						return sum, err
 					}
@@ -336,11 +331,11 @@ func (s *MongoEndpoint) doConsumeSlowly(rows []*global.RowRequest) (int64, error
 						return sum, err
 					}
 				}
-				logutil.Infof("action:%s, collection:%s, id:%v, data:%v",
+				logs.Infof("action:%s, collection:%s, id:%v, data:%v",
 					row.Action, collection.Name(), resp.Id, resp.Table)
 			}
 		} else {
-			kvm := keyValueMap(row, rule, false)
+			kvm := rowMap(row, rule, false)
 			id := primaryKey(row, rule)
 			kvm["_id"] = id
 
@@ -351,13 +346,13 @@ func (s *MongoEndpoint) doConsumeSlowly(rows []*global.RowRequest) (int64, error
 				_, err := collection.InsertOne(context.Background(), kvm)
 				if err != nil {
 					if s.isDuplicateKeyError(err.Error()) {
-						logutil.Warnf("duplicate key [ %v ]", stringutil.ToJsonString(kvm))
+						logs.Warnf("duplicate key [ %v ]", stringutil.ToJsonString(kvm))
 					} else {
 						return sum, err
 					}
 				}
 			case canal.UpdateAction:
-				_, err := collection.UpdateOne(context.Background(), bson.M{"_id": id}, kvm)
+				_, err := collection.UpdateOne(context.Background(), bson.M{"_id": id}, bson.M{"$set": kvm})
 				if err != nil {
 					return sum, err
 				}
@@ -368,54 +363,11 @@ func (s *MongoEndpoint) doConsumeSlowly(rows []*global.RowRequest) (int64, error
 				}
 			}
 
-			logutil.Infof("action:%s, collection:%s, id:%v, data:%v", row.Action, collection.Name(), id, kvm)
+			logs.Infof("action:%s, collection:%s, id:%v, data:%v", row.Action, collection.Name(), id, kvm)
 		}
 		sum++
 	}
 	return sum, nil
-}
-
-func (s *MongoEndpoint) doRetryTask() error {
-	if s.cached.Size() == 0 {
-		return nil
-	}
-
-	if err := s.Ping(); err != nil {
-		return err
-	}
-
-	logutil.Infof("当前重试队列有%d 条数据", s.cached.Size())
-
-	var data []byte
-	ids := s.cached.IdList()
-	for _, id := range ids {
-		var err error
-		data, err = s.cached.Get(id)
-		if err != nil {
-			logutil.Warn(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		var row global.RowRequest
-		err = msgpack.Unmarshal(data, &row)
-		if err != nil {
-			logutil.Warn(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		rows := []*global.RowRequest{&row}
-		_, err = s.doConsumeSlowly(rows)
-		if err != nil {
-			return err
-		}
-
-		logutil.Infof("cached id :%d , 数据重试成功", id)
-		s.cached.Delete(id)
-	}
-
-	return nil
 }
 
 func (s *MongoEndpoint) Close() {

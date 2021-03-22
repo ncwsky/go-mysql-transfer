@@ -31,9 +31,9 @@ import (
 
 	"go-mysql-transfer/global"
 	"go-mysql-transfer/util/byteutil"
-	"go-mysql-transfer/util/fileutil"
-	"go-mysql-transfer/util/logutil"
-	"go-mysql-transfer/util/zkutil"
+	"go-mysql-transfer/util/files"
+	"go-mysql-transfer/util/logagent"
+	"go-mysql-transfer/util/zookeepers"
 )
 
 const (
@@ -43,29 +43,31 @@ const (
 )
 
 var (
-	_rowRequestBucket = []byte("RowRequest")
-	_positionBucket   = []byte("Position")
-	_fixPositionId    = byteutil.Uint64ToBytes(uint64(1))
+	_positionBucket = []byte("Position")
+	_fixPositionId  = byteutil.Uint64ToBytes(uint64(1))
 
-	_bolt     *bbolt.DB
-	_zkConn   *zk.Conn
+	_bolt           *bbolt.DB
+	_zkConn         *zk.Conn
+	_zkStatusSignal <-chan zk.Event
+	_zkAddresses    []string
+
 	_etcdConn *clientv3.Client
 	_etcdOps  clientv3.KV
 )
 
-func InitStorage(conf *global.Config) error {
-	if err := initBolt(conf); err != nil {
+func Initialize() error {
+	if err := initBolt(); err != nil {
 		return err
 	}
 
-	if conf.IsZk() {
-		if err := initZk(conf); err != nil {
+	if global.Cfg().IsZk() {
+		if err := initZk(); err != nil {
 			return err
 		}
 	}
 
-	if conf.IsEtcd() {
-		if err := initEtcd(conf); err != nil {
+	if global.Cfg().IsEtcd() {
+		if err := initEtcd(); err != nil {
 			return err
 		}
 	}
@@ -73,9 +75,9 @@ func InitStorage(conf *global.Config) error {
 	return nil
 }
 
-func initBolt(conf *global.Config) error {
-	blotStorePath := filepath.Join(conf.DataDir, _boltFilePath)
-	if err := fileutil.MkdirIfNecessary(blotStorePath); err != nil {
+func initBolt() error {
+	blotStorePath := filepath.Join(global.Cfg().DataDir, _boltFilePath)
+	if err := files.MkdirIfNecessary(blotStorePath); err != nil {
 		return errors.New(fmt.Sprintf("create boltdb store : %s", err.Error()))
 	}
 
@@ -86,7 +88,6 @@ func initBolt(conf *global.Config) error {
 	}
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
-		tx.CreateBucketIfNotExists(_rowRequestBucket)
 		tx.CreateBucketIfNotExists(_positionBucket)
 		return nil
 	})
@@ -96,47 +97,49 @@ func initBolt(conf *global.Config) error {
 	return err
 }
 
-func initZk(conf *global.Config) error {
-	option := zk.WithLogger(logutil.NewZkLoggerAgent())
-	list := strings.Split(conf.Cluster.ZkAddrs, ",")
-	conn, _, err := zk.Connect(list, time.Second, option) //*10)
+func initZk() error {
+	option := zk.WithLogger(logagent.NewZkLoggerAgent())
+	list := strings.Split(global.Cfg().Cluster.ZkAddrs, ",")
+	conn, sig, err := zk.Connect(list, time.Second, option) //*10)
 
 	if err != nil {
 		return err
 	}
 
-	if conf.Cluster.ZkAuthentication != "" {
-		err = conn.AddAuth("digest", []byte(conf.Cluster.ZkAuthentication))
+	if global.Cfg().Cluster.ZkAuthentication != "" {
+		err = conn.AddAuth("digest", []byte(global.Cfg().Cluster.ZkAuthentication))
 		if err != nil {
 			return err
 		}
 	}
 
-	err = zkutil.CreateDirIfNecessary(conf.ZeRootDir(), conn)
+	err = zookeepers.CreateDirIfNecessary(global.Cfg().ZkRootDir(), conn)
 	if err != nil {
 		return err
 	}
 
-	err = zkutil.CreateDirIfNecessary(conf.ZeClusterDir(), conn)
+	err = zookeepers.CreateDirIfNecessary(global.Cfg().ZkClusterDir(), conn)
 	if err != nil {
 		return err
 	}
 
+	_zkAddresses = list
 	_zkConn = conn
+	_zkStatusSignal = sig
 
 	return nil
 }
 
-func initEtcd(conf *global.Config) error {
-	etcdlog.DefaultZapLoggerConfig = logutil.EtcdZapLoggerConfig()
-	clientv3.SetLogger(logutil.NewEtcdLoggerAgent())
+func initEtcd() error {
+	etcdlog.DefaultZapLoggerConfig = logagent.EtcdZapLoggerConfig()
+	clientv3.SetLogger(logagent.NewEtcdLoggerAgent())
 
-	list := strings.Split(conf.Cluster.EtcdAddrs, ",")
+	list := strings.Split(global.Cfg().Cluster.EtcdAddrs, ",")
 	config := clientv3.Config{
 		Endpoints:   list,
-		Username:    conf.Cluster.EtcdUser,
-		Password:    conf.Cluster.EtcdPassword,
-		DialTimeout: 10 * time.Second,
+		Username:    global.Cfg().Cluster.EtcdUser,
+		Password:    global.Cfg().Cluster.EtcdPassword,
+		DialTimeout: 1 * time.Second,
 	}
 
 	client, err := clientv3.New(config)
@@ -153,6 +156,14 @@ func ZKConn() *zk.Conn {
 	return _zkConn
 }
 
+func ZKStatusSignal() <-chan zk.Event {
+	return _zkStatusSignal
+}
+
+func ZKAddresses() []string {
+	return _zkAddresses
+}
+
 func EtcdConn() *clientv3.Client {
 	return _etcdConn
 }
@@ -161,7 +172,7 @@ func EtcdOps() clientv3.KV {
 	return _etcdOps
 }
 
-func CloseStorage() {
+func Close() {
 	if _bolt != nil {
 		_bolt.Close()
 	}

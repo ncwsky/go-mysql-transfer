@@ -18,11 +18,15 @@
 package luaengine
 
 import (
-	lua "github.com/yuin/gopher-lua"
+	"github.com/siddontang/go-mysql/canal"
+	"github.com/yuin/gopher-lua"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/model"
 	"go-mysql-transfer/util/stringutil"
 )
+
+const _globalOLDROW = "___OLDROW___"
 
 func redisModule(L *lua.LState) int {
 	t := L.NewTable()
@@ -33,6 +37,7 @@ func redisModule(L *lua.LState) int {
 
 var _redisModuleApi = map[string]lua.LGFunction{
 	"rawRow":    rawRow,
+	"rawOldRow": rawOldRow,
 	"rawAction": rawAction,
 
 	"SET": redisSet,
@@ -46,6 +51,15 @@ var _redisModuleApi = map[string]lua.LGFunction{
 
 	"SADD": redisSAdd,
 	"SREM": redisSRem,
+
+	"ZADD": redisZAdd,
+	"ZREM": redisZRem,
+}
+
+func rawOldRow(L *lua.LState) int {
+	row := L.GetGlobal(_globalOLDROW)
+	L.Push(row)
+	return 1
 }
 
 func redisSet(L *lua.LState) int {
@@ -128,7 +142,31 @@ func redisSRem(L *lua.LState) int {
 	return 0
 }
 
-func DoRedisOps(input map[string]interface{}, action string, rule *global.Rule) ([]*global.RedisRespond, error) {
+func redisZAdd(L *lua.LState) int {
+	key := L.CheckString(1)
+	score := L.CheckAny(2)
+	val := L.CheckAny(3)
+
+	hash := L.NewTable()
+	L.SetTable(hash, lua.LString("key"), lua.LString(key))
+	L.SetTable(hash, lua.LString("score"), score)
+	L.SetTable(hash, lua.LString("val"), val)
+
+	ret := L.GetGlobal(_globalRET)
+	L.SetTable(ret, lua.LString("insert_5_"+stringutil.UUID()), hash)
+	return 0
+}
+
+func redisZRem(L *lua.LState) int {
+	key := L.CheckString(1)
+	val := L.CheckAny(2)
+
+	ret := L.GetGlobal(_globalRET)
+	L.SetTable(ret, lua.LString("delete_5_"+key), val)
+	return 0
+}
+
+func DoRedisOps(input map[string]interface{}, previous map[string]interface{}, action string, rule *global.Rule) ([]*model.RedisRespond, error) {
 	L := _pool.Get()
 	defer _pool.Put(L)
 
@@ -139,6 +177,12 @@ func DoRedisOps(input map[string]interface{}, action string, rule *global.Rule) 
 	L.SetGlobal(_globalROW, row)
 	L.SetGlobal(_globalACT, lua.LString(action))
 
+	if action == canal.UpdateAction {
+		oldRow := L.NewTable()
+		paddingTable(L, oldRow, previous)
+		L.SetGlobal(_globalOLDROW, oldRow)
+	}
+
 	funcFromProto := L.NewFunctionFromProto(rule.LuaProto)
 	L.Push(funcFromProto)
 	err := L.PCall(0, lua.MultRet, nil)
@@ -146,29 +190,56 @@ func DoRedisOps(input map[string]interface{}, action string, rule *global.Rule) 
 		return nil, err
 	}
 
-	ls := make([]*global.RedisRespond, 0, ret.Len())
+	ls := make([]*model.RedisRespond, 0, ret.Len())
 	ret.ForEach(func(k lua.LValue, v lua.LValue) {
-		resp := global.RedisRespondPool.Get().(*global.RedisRespond)
+		resp := new(model.RedisRespond)
 		kk := lvToString(k)
-		action := kk[0:6]
-		structure := kk[7:8]
-
-		resp.Action = action
-		resp.Structure = structure
-		if structure == global.RedisStructureHash {
-			key := L.GetTable(v, lua.LString("key"))
-			field := L.GetTable(v, lua.LString("field"))
-			val := L.GetTable(v, lua.LString("val"))
-			resp.Key = key.String()
-			resp.Field = lvToString(field)
-			resp.Val = lvToInterface(val, true)
-		} else {
+		resp.Action = kk[0:6]
+		resp.Structure = structureName(kk[7:8])
+		if resp.Action == canal.DeleteAction {
 			resp.Key = kk[9:len(kk)]
 			resp.Val = lvToInterface(v, true)
+		} else {
+			if resp.Structure == global.RedisStructureHash {
+				key := L.GetTable(v, lua.LString("key"))
+				field := L.GetTable(v, lua.LString("field"))
+				val := L.GetTable(v, lua.LString("val"))
+				resp.Key = key.String()
+				resp.Field = lvToString(field)
+				resp.Val = lvToInterface(val, true)
+			} else if resp.Structure == global.RedisStructureSortedSet {
+				key := L.GetTable(v, lua.LString("key"))
+				score := L.GetTable(v, lua.LString("score"))
+				val := L.GetTable(v, lua.LString("val"))
+				resp.Key = key.String()
+				scoreTemp := lvToString(score)
+				resp.Score = stringutil.ToFloat64Safe(scoreTemp)
+				resp.Val = lvToInterface(val, true)
+			} else {
+				resp.Key = kk[9:len(kk)]
+				resp.Val = lvToInterface(v, true)
+			}
 		}
 
 		ls = append(ls, resp)
 	})
 
 	return ls, nil
+}
+
+func structureName(code string) string {
+	switch code {
+	case "1":
+		return global.RedisStructureString
+	case "2":
+		return global.RedisStructureHash
+	case "3":
+		return global.RedisStructureList
+	case "4":
+		return global.RedisStructureSet
+	case "5":
+		return global.RedisStructureSortedSet
+	}
+
+	return ""
 }

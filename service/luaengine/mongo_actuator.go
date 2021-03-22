@@ -20,9 +20,10 @@ package luaengine
 import (
 	"github.com/juju/errors"
 	"github.com/siddontang/go-mysql/canal"
-	lua "github.com/yuin/gopher-lua"
+	"github.com/yuin/gopher-lua"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/model"
 	"go-mysql-transfer/util/stringutil"
 )
 
@@ -40,6 +41,7 @@ var _mongoModuleApi = map[string]lua.LGFunction{
 	"INSERT": mongoInsert,
 	"UPDATE": mongoUpdate,
 	"DELETE": mongoDelete,
+	"UPSERT": mongoUpsert,
 }
 
 func mongoInsert(L *lua.LState) int {
@@ -72,6 +74,22 @@ func mongoUpdate(L *lua.LState) int {
 	return 0
 }
 
+func mongoUpsert(L *lua.LState) int {
+	collection := L.CheckAny(1)
+	id := L.CheckAny(2)
+	table := L.CheckAny(3)
+
+	data := L.NewTable()
+	L.SetTable(data, lua.LString("collection"), collection)
+	L.SetTable(data, lua.LString("action"), lua.LString(global.UpsertAction))
+	L.SetTable(data, lua.LString("id"), id)
+	L.SetTable(data, lua.LString("table"), table)
+
+	ret := L.GetGlobal(_globalRET)
+	L.SetTable(ret, lua.LString(stringutil.UUID()), data)
+	return 0
+}
+
 func mongoDelete(L *lua.LState) int {
 	collection := L.CheckAny(1)
 	id := L.CheckAny(2)
@@ -86,7 +104,7 @@ func mongoDelete(L *lua.LState) int {
 	return 0
 }
 
-func DoMongoOps(input map[string]interface{}, action string, rule *global.Rule) ([]*global.MongoRespond, error) {
+func DoMongoOps(input map[string]interface{}, action string, rule *global.Rule) ([]*model.MongoRespond, error) {
 	L := _pool.Get()
 	defer _pool.Put(L)
 
@@ -105,9 +123,9 @@ func DoMongoOps(input map[string]interface{}, action string, rule *global.Rule) 
 	}
 
 	asserted := true
-	responds := make([]*global.MongoRespond, 0, ret.Len())
+	responds := make([]*model.MongoRespond, 0, ret.Len())
 	ret.ForEach(func(k lua.LValue, v lua.LValue) {
-		resp := new(global.MongoRespond)
+		resp := new(model.MongoRespond)
 		resp.Collection = lvToString(L.GetTable(v, lua.LString("collection")))
 		resp.Action = lvToString(L.GetTable(v, lua.LString("action")))
 		resp.Id = lvToInterface(L.GetTable(v, lua.LString("id")), true)

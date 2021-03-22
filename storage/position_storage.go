@@ -29,17 +29,13 @@ type PositionStorage interface {
 	Get() (mysql.Position, error)
 }
 
-func NewPositionStorage(conf *global.Config) PositionStorage {
-	if conf.IsCluster() {
-		if conf.IsZk() {
-			return &zkPositionStorage{
-				Conf: conf,
-			}
+func NewPositionStorage() PositionStorage {
+	if global.Cfg().IsCluster() {
+		if global.Cfg().IsZk() {
+			return &zkPositionStorage{}
 		}
-		if conf.IsEtcd() {
-			return &etcdPositionStorage{
-				Conf: conf,
-			}
+		if global.Cfg().IsEtcd() {
+			return &etcdPositionStorage{}
 		}
 	}
 

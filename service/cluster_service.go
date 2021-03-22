@@ -18,44 +18,48 @@
 package service
 
 import (
+	"log"
+
 	"go-mysql-transfer/global"
-	"go-mysql-transfer/service/cluster"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/metrics"
 )
 
 type ClusterService struct {
-	electionCh chan bool
-	election   cluster.Election
+	electionSignal chan bool //选举信号
 }
 
-func (s *ClusterService) boot(cfg *global.Config) error {
-	s.electionCh = make(chan bool, 1)
-	s.election = cluster.NewElection(s.electionCh, cfg)
-	logutil.BothInfof("Start master election...")
-
-	err := s.election.Elect()
+func (s *ClusterService) boot() error {
+	log.Println("start master election")
+	err := _electionService.Elect()
 	if err != nil {
 		return err
 	}
 
-	go s.startElectListener()
+	s.startElectListener()
 
 	return nil
 }
 
 func (s *ClusterService) startElectListener() {
-	for {
-		select {
-		case flag := <-s.electionCh:
-			if flag {
-				global.SetLeaderState(global.MetricsStateOK)
-				TransferServiceIns().Restart()
-				logutil.BothInfof("The current node is the master")
-			} else {
-				global.SetLeaderState(global.MetricsStateNO)
-				TransferServiceIns().Pause()
-				logutil.BothInfof("The current node is the follower, master node is : %s", s.election.Leader())
+	go func() {
+		for {
+			select {
+			case selected := <-s.electionSignal:
+				global.SetLeaderNode(_electionService.Leader())
+				global.SetLeaderFlag(selected)
+				if selected {
+					metrics.SetLeaderState(metrics.LeaderState)
+					_transferService.StartUp()
+				} else {
+					metrics.SetLeaderState(metrics.FollowerState)
+					_transferService.stopDump()
+				}
 			}
 		}
-	}
+
+	}()
+}
+
+func (s *ClusterService) Nodes() []string {
+	return _electionService.Nodes()
 }

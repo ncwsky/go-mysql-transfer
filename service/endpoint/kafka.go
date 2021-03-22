@@ -18,47 +18,47 @@
 package endpoint
 
 import (
+	"github.com/siddontang/go-mysql/canal"
+	"log"
 	"strings"
+	"sync"
 
 	"github.com/Shopify/sarama"
 	"github.com/juju/errors"
-	"github.com/pquerna/ffjson/ffjson"
-	"github.com/vmihailenco/msgpack"
+	"github.com/siddontang/go-mysql/mysql"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/metrics"
+	"go-mysql-transfer/model"
 	"go-mysql-transfer/service/luaengine"
-	"go-mysql-transfer/storage"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/util/logs"
 )
 
 type KafkaEndpoint struct {
-	config *global.Config
-	cached *storage.BoltRowStorage
-
 	client   sarama.Client
 	producer sarama.AsyncProducer
+
+	retryLock sync.Mutex
 }
 
-func newKafkaEndpoint(c *global.Config) *KafkaEndpoint {
+func newKafkaEndpoint() *KafkaEndpoint {
 	r := &KafkaEndpoint{}
-	r.config = c
-	r.cached = &storage.BoltRowStorage{}
 	return r
 }
 
-func (s *KafkaEndpoint) Start() error {
+func (s *KafkaEndpoint) Connect() error {
 	cfg := sarama.NewConfig()
 	cfg.Producer.Partitioner = sarama.NewRandomPartitioner
 
-	if s.config.KafkaSASLUser != "" && s.config.KafkaSASLPassword != "" {
+	if global.Cfg().KafkaSASLUser != "" && global.Cfg().KafkaSASLPassword != "" {
 		cfg.Net.SASL.Enable = true
-		cfg.Net.SASL.User = s.config.KafkaSASLUser
-		cfg.Net.SASL.Password = s.config.KafkaSASLPassword
+		cfg.Net.SASL.User = global.Cfg().KafkaSASLUser
+		cfg.Net.SASL.Password = global.Cfg().KafkaSASLPassword
 	}
 
 	var err error
 	var client sarama.Client
-	ls := strings.Split(s.config.KafkaAddr, ",")
+	ls := strings.Split(global.Cfg().KafkaAddr, ",")
 	client, err = sarama.NewClient(ls, cfg)
 	if err != nil {
 		return errors.Errorf("unable to create kafka client: %q", err)
@@ -77,83 +77,62 @@ func (s *KafkaEndpoint) Start() error {
 }
 
 func (s *KafkaEndpoint) Ping() error {
-	return nil
+	return s.client.RefreshMetadata()
 }
 
-func (s *KafkaEndpoint) Consume(rows []*global.RowRequest) {
-	if err := s.doRetryTask(); err != nil {
-		logutil.Error(err.Error())
-		pushFailedRows(rows, s.cached)
-		return
-	}
-
-	expect := true
+func (s *KafkaEndpoint) Consume(from mysql.Position, rows []*model.RowRequest) error {
 	var ms []*sarama.ProducerMessage
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		exportActionNum(row.Action, row.RuleKey)
+		metrics.UpdateActionNum(row.Action, row.RuleKey)
 
-		if rule.LuaNecessary() {
+		if rule.LuaEnable() {
 			ls, err := s.buildMessages(row, rule)
 			if err != nil {
-				logutil.Errorf(errors.ErrorStack(err))
-				expect = false
-				break
+				log.Println("Lua 脚本执行失败!!! ,详情请参见日志")
+				return errors.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
 			}
 			ms = append(ms, ls...)
 		} else {
 			m, err := s.buildMessage(row, rule)
 			if err != nil {
-				logutil.Errorf(errors.ErrorStack(err))
-				expect = false
-				break
+				return errors.Errorf(errors.ErrorStack(err))
 			}
 			ms = append(ms, m)
 		}
-	}
-
-	if !expect {
-		pushFailedRows(rows, s.cached)
-		return
 	}
 
 	for _, m := range ms {
 		s.producer.Input() <- m
 		select {
 		case err := <-s.producer.Errors():
-			logutil.Error(err.Error())
-			expect = false
-			break
+			return err
 		default:
-
 		}
 	}
 
-	if !expect {
-		pushFailedRows(rows, s.cached)
-	} else {
-		logutil.Infof("处理完成 %d 条数据", len(rows))
-	}
+	logs.Infof("处理完成 %d 条数据", len(rows))
+	return nil
 }
 
-func (s *KafkaEndpoint) Stock(rows []*global.RowRequest) int64 {
+func (s *KafkaEndpoint) Stock(rows []*model.RowRequest) int64 {
 	expect := true
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		if rule.LuaNecessary() {
+		if rule.LuaEnable() {
 			ls, err := s.buildMessages(row, rule)
 			if err != nil {
-				logutil.Errorf(errors.ErrorStack(err))
+				logs.Errorf(errors.ErrorStack(err))
 				expect = false
 				break
 			}
@@ -161,7 +140,7 @@ func (s *KafkaEndpoint) Stock(rows []*global.RowRequest) int64 {
 				s.producer.Input() <- m
 				select {
 				case err := <-s.producer.Errors():
-					logutil.Error(err.Error())
+					logs.Error(err.Error())
 					expect = false
 					break
 				default:
@@ -173,14 +152,14 @@ func (s *KafkaEndpoint) Stock(rows []*global.RowRequest) int64 {
 		} else {
 			m, err := s.buildMessage(row, rule)
 			if err != nil {
-				logutil.Errorf(errors.ErrorStack(err))
+				logs.Errorf(errors.ErrorStack(err))
 				expect = false
 				break
 			}
 			s.producer.Input() <- m
 			select {
 			case err := <-s.producer.Errors():
-				logutil.Error(err.Error())
+				logs.Error(err.Error())
 				expect = false
 				break
 			default:
@@ -196,8 +175,8 @@ func (s *KafkaEndpoint) Stock(rows []*global.RowRequest) int64 {
 	return int64(len(rows))
 }
 
-func (s *KafkaEndpoint) buildMessages(row *global.RowRequest, rule *global.Rule) ([]*sarama.ProducerMessage, error) {
-	kvm := keyValueMap(row, rule, true)
+func (s *KafkaEndpoint) buildMessages(row *model.RowRequest, rule *global.Rule) ([]*sarama.ProducerMessage, error) {
+	kvm := rowMap(row, rule, true)
 	ls, err := luaengine.DoMQOps(kvm, row.Action, rule)
 	if err != nil {
 		return nil, errors.Errorf("lua 脚本执行失败 : %s ", err)
@@ -209,27 +188,29 @@ func (s *KafkaEndpoint) buildMessages(row *global.RowRequest, rule *global.Rule)
 			Topic: resp.Topic,
 			Value: sarama.ByteEncoder(resp.ByteArray),
 		}
-
-		logutil.Infof("topic: %s, message: %s", resp.Topic, string(resp.ByteArray))
-
-		global.MQRespondPool.Put(resp)
+		logs.Infof("topic: %s, message: %s", resp.Topic, string(resp.ByteArray))
 		ms = append(ms, m)
 	}
 
 	return ms, nil
 }
 
-func (s *KafkaEndpoint) buildMessage(row *global.RowRequest, rule *global.Rule) (*sarama.ProducerMessage, error) {
-	kvm := keyValueMap(row, rule, false)
-	resp := global.MQRespondPool.Get().(*global.MQRespond)
+func (s *KafkaEndpoint) buildMessage(row *model.RowRequest, rule *global.Rule) (*sarama.ProducerMessage, error) {
+	kvm := rowMap(row, rule, false)
+	resp := new(model.MQRespond)
 	resp.Action = row.Action
+	resp.Timestamp = row.Timestamp
 	if rule.ValueEncoder == global.ValEncoderJson {
 		resp.Date = kvm
 	} else {
-		resp.Date = encodeStringValue(rule, kvm)
+		resp.Date = encodeValue(rule, kvm)
 	}
-	body, err := ffjson.Marshal(resp)
-	global.MQRespondPool.Put(resp)
+
+	if rule.ReserveRawData && canal.UpdateAction == row.Action {
+		resp.Raw = oldRowMap(row, rule, false)
+	}
+
+	body, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err
 	}
@@ -237,78 +218,8 @@ func (s *KafkaEndpoint) buildMessage(row *global.RowRequest, rule *global.Rule) 
 		Topic: rule.KafkaTopic,
 		Value: sarama.ByteEncoder(body),
 	}
-
-	logutil.Infof("topic: %s, message: %s", rule.KafkaTopic, string(body))
-
+	logs.Infof("topic: %s, message: %s", rule.KafkaTopic, string(body))
 	return m, nil
-}
-
-func (s *KafkaEndpoint) doRetryTask() error {
-	if s.cached.Size() == 0 {
-		return nil
-	}
-
-	if err := s.Ping(); err != nil {
-		return err
-	}
-
-	logutil.Infof("当前重试队列有%d 条数据", s.cached.Size())
-
-	var data []byte
-	ids := s.cached.IdList()
-	for _, id := range ids {
-		var err error
-		data, err = s.cached.Get(id)
-		if err != nil {
-			logutil.Warn(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		var row global.RowRequest
-		err = msgpack.Unmarshal(data, row)
-		if err != nil {
-			logutil.Errorf(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		rule, _ := global.RuleIns(row.RuleKey)
-		if rule.LuaNecessary() {
-			ls, err := s.buildMessages(&row, rule)
-			if err != nil {
-				return err
-			}
-			for _, msg := range ls {
-				s.producer.Input() <- msg
-				select {
-				case err := <-s.producer.Errors():
-					logutil.Error(err.Error())
-					return err
-				default:
-
-				}
-			}
-		} else {
-			msg, err := s.buildMessage(&row, rule)
-			if err != nil {
-				return err
-			}
-			s.producer.Input() <- msg
-			select {
-			case err := <-s.producer.Errors():
-				logutil.Error(err.Error())
-				return err
-			default:
-
-			}
-		}
-
-		logutil.Infof("cached id :%d , 数据重试成功", id)
-		s.cached.Delete(id)
-	}
-
-	return nil
 }
 
 func (s *KafkaEndpoint) Close() {

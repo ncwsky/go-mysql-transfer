@@ -25,6 +25,8 @@ import (
 )
 
 type boltPositionStorage struct {
+	Name string
+	Pos  uint32
 }
 
 func (s *boltPositionStorage) Initialize() error {
@@ -62,7 +64,6 @@ func (s *boltPositionStorage) Get() (mysql.Position, error) {
 		if data == nil {
 			return errors.NotFoundf("PositionStorage")
 		}
-
 		return msgpack.Unmarshal(data, &entity)
 	})
 

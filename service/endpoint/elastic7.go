@@ -19,45 +19,45 @@ package endpoint
 
 import (
 	"context"
-	"fmt"
+	"log"
+	"sync"
 
 	"github.com/juju/errors"
 	"github.com/olivere/elastic/v7"
 	"github.com/siddontang/go-mysql/canal"
-	"github.com/vmihailenco/msgpack"
+	"github.com/siddontang/go-mysql/mysql"
 
 	"go-mysql-transfer/global"
+	"go-mysql-transfer/metrics"
+	"go-mysql-transfer/model"
 	"go-mysql-transfer/service/luaengine"
-	"go-mysql-transfer/storage"
-	"go-mysql-transfer/util/logutil"
+	"go-mysql-transfer/util/logagent"
+	"go-mysql-transfer/util/logs"
 	"go-mysql-transfer/util/stringutil"
 )
 
 type Elastic7Endpoint struct {
-	config *global.Config
-	cached *storage.BoltRowStorage
-
 	first  string
 	hosts  []string
 	client *elastic.Client
+
+	retryLock sync.Mutex
 }
 
-func newElastic7Endpoint(c *global.Config) *Elastic7Endpoint {
-	hosts := elsHosts(c.ElsAddr)
+func newElastic7Endpoint() *Elastic7Endpoint {
+	hosts := elsHosts(global.Cfg().ElsAddr)
 	r := &Elastic7Endpoint{}
-	r.config = c
-	r.cached = &storage.BoltRowStorage{}
 	r.hosts = hosts
 	r.first = hosts[0]
 	return r
 }
 
-func (s *Elastic7Endpoint) Start() error {
+func (s *Elastic7Endpoint) Connect() error {
 	var options []elastic.ClientOptionFunc
-	options = append(options, elastic.SetErrorLog(logutil.NewElsLoggerAgent()))
+	options = append(options, elastic.SetErrorLog(logagent.NewElsLoggerAgent()))
 	options = append(options, elastic.SetURL(s.hosts...))
-	if s.config.ElsUser != "" && s.config.ElsPassword != "" {
-		options = append(options, elastic.SetBasicAuth(s.config.ElsUser, s.config.Password))
+	if global.Cfg().ElsUser != "" && global.Cfg().ElsPassword != "" {
+		options = append(options, elastic.SetBasicAuth(global.Cfg().ElsUser, global.Cfg().Password))
 	}
 
 	client, err := elastic.NewClient(options...)
@@ -90,7 +90,7 @@ func (s *Elastic7Endpoint) indexMapping() error {
 
 func (s *Elastic7Endpoint) insertIndexMapping(rule *global.Rule) error {
 	var properties map[string]interface{}
-	if rule.LuaNecessary() {
+	if rule.LuaEnable() {
 		properties = buildPropertiesByMappings(rule)
 	} else {
 		properties = buildPropertiesByRule(rule)
@@ -111,7 +111,7 @@ func (s *Elastic7Endpoint) insertIndexMapping(rule *global.Rule) error {
 		return errors.Errorf("create index %s err", rule.ElsIndex)
 	}
 
-	logutil.Infof("create index: %s ,mappings: %s", rule.ElsIndex, body)
+	logs.Infof("create index: %s ,mappings: %s", rule.ElsIndex, body)
 
 	return nil
 }
@@ -123,10 +123,17 @@ func (s *Elastic7Endpoint) updateIndexMapping(rule *global.Rule) error {
 	}
 	retIndex := ret[rule.ElsIndex].(map[string]interface{})
 	retMaps := retIndex["mappings"].(map[string]interface{})
+	if retMaps == nil {
+		return nil
+	}
+
 	retPros := retMaps["properties"].(map[string]interface{})
+	if retPros == nil {
+		return nil
+	}
 
 	var currents map[string]interface{}
-	if rule.LuaNecessary() {
+	if rule.LuaEnable() {
 		currents = buildPropertiesByMappings(rule)
 	} else {
 		currents = buildPropertiesByRule(rule)
@@ -152,7 +159,7 @@ func (s *Elastic7Endpoint) updateIndexMapping(rule *global.Rule) error {
 			return errors.Errorf("update index %s err", rule.ElsIndex)
 		}
 
-		logutil.Infof("create index: %s ,properties: %s", rule.ElsIndex, doc)
+		logs.Infof("update index: %s ,properties: %s", rule.ElsIndex, doc)
 	}
 
 	return nil
@@ -172,107 +179,105 @@ func (s *Elastic7Endpoint) Ping() error {
 	return errors.New("ssx")
 }
 
-func (s *Elastic7Endpoint) Consume(rows []*global.RowRequest) {
-	if err := s.doRetryTask(); err != nil {
-		logutil.Error(err.Error())
-		pushFailedRows(rows, s.cached)
-		return
-	}
-
-	expect := true
+func (s *Elastic7Endpoint) Consume(from mysql.Position, rows []*model.RowRequest) error {
 	bulk := s.client.Bulk()
 	for _, row := range rows {
 		rule, _ := global.RuleIns(row.RuleKey)
 		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
+			logs.Warnf("%s schema mismatching", row.RuleKey)
 			continue
 		}
 
-		exportActionNum(row.Action, row.RuleKey)
+		metrics.UpdateActionNum(row.Action, row.RuleKey)
 
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(row, rule, true)
+		if rule.LuaEnable() {
+			kvm := rowMap(row, rule, true)
 			ls, err := luaengine.DoESOps(kvm, row.Action, rule)
 			if err != nil {
-				logutil.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
-				expect = false
-				break
+				log.Println("Lua 脚本执行失败!!! ,详情请参见日志")
+				return errors.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
 			}
 			for _, resp := range ls {
-				logutil.Infof("action: %s, Index: %s , Id:%s, value: %v", resp.Action, resp.Index, resp.Id, resp.Date)
+				logs.Infof("action: %s, Index: %s , Id:%s, value: %v", resp.Action, resp.Index, resp.Id, resp.Date)
 				s.prepareBulk(resp.Action, resp.Index, resp.Id, resp.Date, bulk)
 			}
 		} else {
-			kvm := keyValueMap(row, rule, false)
+			kvm := rowMap(row, rule, false)
 			id := primaryKey(row, rule)
-			body := encodeStringValue(rule, kvm)
-			logutil.Infof("action: %s, Index: %s , Id:%s, value: %v", row.Action, rule.ElsIndex, id, body)
-			s.prepareBulk(row.Action, rule.ElsIndex, stringutil.ToString(id), body, bulk)
-		}
-
-		global.RowRequestPool.Put(row)
-	}
-
-	r, err := bulk.Do(context.Background())
-	if err != nil {
-		logutil.Error(errors.ErrorStack(err))
-		expect = false
-	}
-
-	if len(r.Failed()) > 0 {
-		expect = false
-		for _, f := range r.Failed() {
-			logutil.Error(f.Error.Reason)
-		}
-	}
-
-	if !expect {
-		pushFailedRows(rows, s.cached)
-	} else {
-		logutil.Infof("处理完成 %d 条数据", len(rows))
-	}
-}
-
-func (s *Elastic7Endpoint) Stock(rows []*global.RowRequest) int64 {
-	bulk := s.client.Bulk()
-	for _, row := range rows {
-		rule, _ := global.RuleIns(row.RuleKey)
-		if rule.TableColumnSize != len(row.Row) {
-			logutil.Warnf("%s schema mismatching", row.RuleKey)
-			continue
-		}
-
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(row, rule, true)
-			ls, err := luaengine.DoESOps(kvm, row.Action, rule)
-			if err != nil {
-				logutil.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
-				break
-			}
-			for _, resp := range ls {
-				s.prepareBulk(resp.Action, resp.Index, resp.Id, resp.Date, bulk)
-			}
-		} else {
-			kvm := keyValueMap(row, rule, false)
-			id := primaryKey(row, rule)
-			body := encodeStringValue(rule, kvm)
-			fmt.Println(body)
+			body := encodeValue(rule, kvm)
+			logs.Infof("action: %s, Index: %s , Id:%s, value: %v", row.Action, rule.ElsIndex, id, body)
 			s.prepareBulk(row.Action, rule.ElsIndex, stringutil.ToString(id), body, bulk)
 		}
 	}
 
 	if bulk.NumberOfActions() == 0 {
-		return 0
+		return nil
 	}
 
 	r, err := bulk.Do(context.Background())
 	if err != nil {
-		logutil.Error(errors.ErrorStack(err))
+		return err
 	}
 
 	if len(r.Failed()) > 0 {
 		for _, f := range r.Failed() {
-			fmt.Println(f.Error.Reason)
+			reason := f.Index + " " + f.Type + " " + f.Result
+			if f.Error == nil && "not_found" == f.Result {
+				return nil
+			}
+
+			if f.Error != nil {
+				reason = f.Error.Reason
+			}
+			log.Println(reason)
+			return errors.New(reason)
+		}
+	}
+
+	logs.Infof("处理完成 %d 条数据", len(rows))
+	return nil
+}
+
+func (s *Elastic7Endpoint) Stock(rows []*model.RowRequest) int64 {
+	if len(rows) == 0 {
+		return 0
+	}
+
+	bulk := s.client.Bulk()
+	for _, row := range rows {
+		rule, _ := global.RuleIns(row.RuleKey)
+		if rule.TableColumnSize != len(row.Row) {
+			logs.Warnf("%s schema mismatching", row.RuleKey)
+			continue
+		}
+
+		if rule.LuaEnable() {
+			kvm := rowMap(row, rule, true)
+			ls, err := luaengine.DoESOps(kvm, row.Action, rule)
+			if err != nil {
+				logs.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
+				break
+			}
+			for _, resp := range ls {
+				s.prepareBulk(resp.Action, resp.Index, resp.Id, resp.Date, bulk)
+			}
+		} else {
+			kvm := rowMap(row, rule, false)
+			id := primaryKey(row, rule)
+			body := encodeValue(rule, kvm)
+			s.prepareBulk(row.Action, rule.ElsIndex, stringutil.ToString(id), body, bulk)
+		}
+	}
+
+	r, err := bulk.Do(context.Background())
+	if err != nil {
+		logs.Error(errors.ErrorStack(err))
+		return 0
+	}
+
+	if len(r.Failed()) > 0 {
+		for _, f := range r.Failed() {
+			logs.Error(f.Error.Reason)
 		}
 	}
 
@@ -292,85 +297,7 @@ func (s *Elastic7Endpoint) prepareBulk(action, index, id, doc string, bulk *elas
 		bulk.Add(req)
 	}
 
-	logutil.Infof("index: %s, doc: %s", index, doc)
-}
-
-func (s *Elastic7Endpoint) doRequest(action, index, id, doc string) error {
-
-	logutil.Infof("index: %s, action:%s, doc: %s", index, action, doc)
-	switch action {
-	case canal.InsertAction:
-		_, err := s.client.Index().Index(index).Id(id).BodyString(doc).Do(context.Background())
-		return err
-	case canal.UpdateAction:
-		_, err := s.client.Update().Index(index).Id(id).Doc(doc).Do(context.Background())
-		return err
-	case canal.DeleteAction:
-		_, err := s.client.Delete().Index(index).Id(id).Do(context.Background())
-		return err
-	}
-
-	return nil
-}
-
-func (s *Elastic7Endpoint) doRetryTask() error {
-	if s.cached.Size() == 0 {
-		return nil
-	}
-
-	if err := s.Ping(); err != nil {
-		return err
-	}
-
-	logutil.Infof("当前重试队列有%d 条数据", s.cached.Size())
-
-	var data []byte
-	ids := s.cached.IdList()
-	for _, id := range ids {
-		var err error
-		data, err = s.cached.Get(id)
-		if err != nil {
-			logutil.Warn(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		var row global.RowRequest
-		err = msgpack.Unmarshal(data, &row)
-		if err != nil {
-			logutil.Warn(err.Error())
-			s.cached.Delete(id)
-			continue
-		}
-
-		rule, _ := global.RuleIns(row.RuleKey)
-		if rule.LuaNecessary() {
-			kvm := keyValueMap(&row, rule, true)
-			ls, err := luaengine.DoESOps(kvm, row.Action, rule)
-			if err != nil {
-				return errors.Errorf("lua 脚本执行失败 : %s ", errors.ErrorStack(err))
-			}
-			for _, resp := range ls {
-				err = s.doRequest(resp.Action, resp.Index, resp.Id, resp.Date)
-				if err != nil {
-					return err
-				}
-			}
-		} else {
-			kvm := keyValueMap(&row, rule, false)
-			id := primaryKey(&row, rule)
-			body := encodeStringValue(rule, kvm)
-			err = s.doRequest(row.Action, rule.ElsIndex, stringutil.ToString(id), body)
-			if err != nil {
-				return err
-			}
-		}
-
-		logutil.Infof("cached id :%d , 数据重试成功", id)
-		s.cached.Delete(id)
-	}
-
-	return nil
+	logs.Infof("index: %s, doc: %s", index, doc)
 }
 
 func (s *Elastic7Endpoint) Close() {
